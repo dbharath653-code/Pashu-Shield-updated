@@ -8,10 +8,15 @@ import json
 import random
 import unittest
 import uuid
+from pathlib import Path
 from unittest import mock
 
 import database
 from app import app, make_token
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FRONTEND_APP = REPO_ROOT / "frontend" / "app.js"
 
 
 def fresh_phone():
@@ -126,7 +131,9 @@ class TestHelpline(unittest.TestCase):
             self.assertNotIn(secret, raw)
 
     def test_03_frontend_click_to_call(self):
-        with open("../frontend/app.js", encoding="utf-8") as f:
+        # Resolve from this file rather than the process working directory so
+        # the suite works from the repository root, CI, or backend/.
+        with FRONTEND_APP.open(encoding="utf-8") as f:
             js = f.read()
         self.assertIn("+917382210251", js)
         self.assertIn("7382210251", js)
