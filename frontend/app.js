@@ -223,9 +223,12 @@ function header(title, opts = {}) {
   return `
   <div class="app-header">
     ${opts.back ? `<button class="header-icon-btn" onclick="history.back()">←</button>`
-      : `<button class="header-icon-btn" onclick="location.hash='${notifHref}'">🔔${opts.notif ? '<span class="dot"></span>' : ''}</button>`}
+      : `<button class="header-icon-btn" onclick="location.hash='${notifHref}'" title="Notifications">🔔${opts.notif ? '<span class="dot"></span>' : ''}</button>`}
     <h1>${title}</h1>
-    <button class="header-icon-btn" onclick="location.hash='${profileHref}'">👤</button>
+    <div style="display:flex;align-items:center;gap:4px">
+      ${role ? `<button class="header-icon-btn" onclick="location.hash='#/'" title="Switch Role / Home">🔄</button>` : ""}
+      <button class="header-icon-btn" onclick="location.hash='${profileHref}'" title="Profile & Settings">👤</button>
+    </div>
   </div>
   ${qCount > 0 ? `
     <div style="text-align:center;margin-top:6px">
@@ -325,8 +328,6 @@ async function router() {
 
   // Not logged in -> only public routes allowed
   if (!state.token && !isPublic(path)) { location.hash = "#/"; return; }
-  // Logged in -> bounce away from public routes to the correct role dashboard
-  if (state.token && isPublic(path)) { location.hash = homeFor(getUserRole() || "owner"); return; }
 
   const matched = Object.keys(routes).find((r) => {
     const rp = r.split("/").map((s) => (s.startsWith(":") ? "(.+)" : s));
@@ -369,7 +370,45 @@ const ROLE_META = {
   lab: { emoji: "🔬", label: "role.lab", color: "#00838f" },
 };
 
+window.clearAppCache = function() {
+  if (confirm("Reset local cache and session? You will be returned to the role selection screen.")) {
+    try { localStorage.clear(); } catch(e) {}
+    try { sessionStorage.clear(); } catch(e) {}
+    if ('caches' in window) {
+      caches.keys().then(names => names.forEach(n => caches.delete(n))).catch(() => {});
+    }
+    toast("Cache and session cleared. Reloading fresh...");
+    setTimeout(() => {
+      location.href = location.origin + location.pathname + "?_t=" + Date.now() + "#/";
+    }, 250);
+  }
+};
+
+function activeSessionBanner(targetRole) {
+  if (!state.token || !state.user) return "";
+  const curRole = getUserRole();
+  const isSame = curRole === targetRole;
+  return `
+    <div class="active-session-banner" style="background:#f0f7ff;border:1.5px solid #2f6fed;border-radius:12px;padding:12px;margin:12px 0 16px;text-align:left;font-size:13px">
+      <div style="font-weight:700;color:#2f6fed;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between">
+        <span>👤 Signed in: ${state.user.full_name}</span>
+        <span class="badge badge-blue">${ROLE_META[curRole]?.emoji || "👤"} ${ROLE_META[curRole]?.label ? t(ROLE_META[curRole].label) : curRole}</span>
+      </div>
+      <div style="color:#475569;margin-bottom:10px;line-height:1.4">
+        ${isSame
+          ? `You are currently signed into this portal. Continue to your dashboard, or enter credentials below to sign in as another user.`
+          : `You are signed in under the <b>${t(ROLE_META[curRole]?.label || curRole)}</b> portal. Signing in below will switch your active session to <b>${t(ROLE_META[targetRole]?.label || targetRole)}</b>.`}
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-primary btn-sm" type="button" style="flex:1" onclick="location.hash='${homeFor(curRole)}'">Go to Dashboard →</button>
+        <button class="btn btn-outline btn-sm" type="button" onclick="logout()">Log Out / Switch</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderRoleSelect() {
+  const curRole = getUserRole();
   render(`
   <div class="auth-wrap">
     <div class="auth-logo">
@@ -377,7 +416,24 @@ function renderRoleSelect() {
       <h2>PashuMitra</h2>
       <p>${t("app.tagline")}</p>
     </div>
-    <div class="section-title" style="text-align:center;margin-bottom:14px">${t("auth.choose")}</div>
+    ${state.token && state.user ? `
+      <div class="active-session-card" style="background:#f0f7ff;border:1.5px solid #2f6fed;border-radius:14px;padding:14px;margin-bottom:16px;text-align:left">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <div style="font-size:11px;font-weight:700;color:#2f6fed;text-transform:uppercase;letter-spacing:0.5px">Active Session</div>
+            <div style="font-size:15px;font-weight:800;color:#1e293b">${state.user.full_name}</div>
+          </div>
+          <span class="badge badge-blue">${ROLE_META[curRole]?.emoji || "👤"} ${ROLE_META[curRole]?.label ? t(ROLE_META[curRole].label) : curRole}</span>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button class="btn btn-primary btn-sm" style="flex:1" onclick="location.hash='${homeFor(curRole)}'">Continue to Dashboard →</button>
+          <button class="btn btn-outline btn-sm" style="color:var(--red);border-color:var(--red)" onclick="logout()">Log Out</button>
+        </div>
+      </div>
+      <div class="section-title" style="text-align:center;margin-bottom:12px">Switch Role or Sign In As Another User</div>
+    ` : `
+      <div class="section-title" style="text-align:center;margin-bottom:14px">${t("auth.choose")}</div>
+    `}
     <div class="role-cards">
       ${ROLES.map(r => `
         <div class="role-card" style="border-left:6px solid ${ROLE_META[r].color}" onclick="location.hash='#/login/${r}'">
@@ -390,6 +446,9 @@ function renderRoleSelect() {
         </div>`).join("")}
     </div>
     ${langToggle()}
+    <div style="text-align:center;margin-top:16px">
+      <button class="btn btn-ghost btn-sm" style="color:#64748b;font-size:12px" onclick="clearAppCache()">🔄 Reset App Cache &amp; Session</button>
+    </div>
   </div>`);
 }
 
@@ -472,16 +531,19 @@ function renderAuth(mode, role) {
 
 function loginForm(role) {
   return `
+  ${activeSessionBanner(role)}
   <form id="loginForm">
     <div class="field"><label>Email or Mobile</label><input name="identifier" required autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="username" inputmode="email" /></div>
     <div class="field"><label>Password</label><input name="password" type="password" required autocomplete="current-password" /></div>
     <button class="btn btn-primary" type="submit">${t("btn.login")}</button>
     <div class="auth-switch">${t("auth.newHere")} <a onclick="location.hash='#/register/${role}'">${t("auth.createAccount")}</a></div>
+    <div class="auth-switch" style="margin-top:6px"><a onclick="location.hash='#/'">← Choose a different role / portal</a></div>
   </form>`;
 }
 
 function registerForm(role) {
   return `
+  ${activeSessionBanner(role)}
   <form id="registerForm">
     <div class="field"><label>Full Name</label><input name="full_name" required autocomplete="name" /></div>
     <div class="form-row">
@@ -500,6 +562,7 @@ function registerForm(role) {
     <div class="field"><label>District</label><input name="district" placeholder="e.g. Pune" required /></div>
     <button class="btn btn-primary" type="submit">${t("btn.register")}</button>
     <div class="auth-switch">${t("auth.haveAccount")} <a onclick="location.hash='#/login/${role}'">${t("btn.login")}</a></div>
+    <div class="auth-switch" style="margin-top:6px"><a onclick="location.hash='#/'">← Choose a different role / portal</a></div>
   </form>`;
 }
 
@@ -518,7 +581,15 @@ async function ownerDashboard() {
   const summary = await api("/owner/summary");
   render(`
     ${header("PashuMitra")}
-    <div class="hello-banner"><div style="margin-top:-16px;font-size:14px;opacity:0.9">Welcome back,</div><div style="font-size:19px;font-weight:800">${state.user.full_name} 👋</div></div>
+    <div class="hello-banner">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-size:14px;opacity:0.9">Welcome back,</div>
+          <div style="font-size:19px;font-weight:800">${state.user.full_name} 👋</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" style="color:#fff;border:1px solid rgba(255,255,255,0.4);font-size:12px;padding:4px 8px;border-radius:8px" onclick="location.hash='#/'">🔄 Switch Role</button>
+      </div>
+    </div>
     <div class="stat-grid">
       ${statCard(summary.animals, "My Animals")}
       ${statCard(summary.active_cases, "Active Cases")}
@@ -554,7 +625,15 @@ async function vetDashboard() {
   const summary = await api("/vet/summary");
   render(`
     ${header("Vet Dashboard")}
-    <div class="hello-banner"><div style="margin-top:-16px;font-size:14px;opacity:0.9">Welcome,</div><div style="font-size:19px;font-weight:800">${state.user.full_name} 🩺</div></div>
+    <div class="hello-banner">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-size:14px;opacity:0.9">Welcome,</div>
+          <div style="font-size:19px;font-weight:800">${state.user.full_name} 🩺</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" style="color:#fff;border:1px solid rgba(255,255,255,0.4);font-size:12px;padding:4px 8px;border-radius:8px" onclick="location.hash='#/'">🔄 Switch Role</button>
+      </div>
+    </div>
     <div class="stat-grid">
       ${statCard(summary.new_cases, "🔴 New Cases")}
       ${statCard(summary.vaccinations_due, "🟠 Vax Due")}
@@ -589,7 +668,15 @@ async function govtDashboard() {
   const a = await api("/govt/analytics");
   render(`
     ${header("Govt Analytics")}
-    <div class="hello-banner"><div style="margin-top:-16px;font-size:14px;opacity:0.9">Maharashtra Animal Disease & Vaccine Dashboard</div><div style="font-size:19px;font-weight:800">${state.user.full_name} 🏛️</div></div>
+    <div class="hello-banner">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-size:13px;opacity:0.9">Maharashtra Animal Disease Dashboard</div>
+          <div style="font-size:18px;font-weight:800">${state.user.full_name} 🏛️</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" style="color:#fff;border:1px solid rgba(255,255,255,0.4);font-size:12px;padding:4px 8px;border-radius:8px" onclick="location.hash='#/'">🔄 Switch Role</button>
+      </div>
+    </div>
     <div class="stat-grid">
       ${statCard(a.totals.cases, "Total Cases")}
       ${statCard(a.totals.active, "Active Cases")}
@@ -631,7 +718,15 @@ async function labDashboard() {
   const sum = await api("/lab/summary");
   render(`
     ${header("Laboratory Portal")}
-    <div class="hello-banner"><div style="margin-top:-16px;font-size:14px;opacity:0.9">Regional Veterinary Diagnostics</div><div style="font-size:19px;font-weight:800">${state.user.full_name} 🔬</div></div>
+    <div class="hello-banner">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-size:14px;opacity:0.9">Regional Veterinary Diagnostics</div>
+          <div style="font-size:19px;font-weight:800">${state.user.full_name} 🔬</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" style="color:#fff;border:1px solid rgba(255,255,255,0.4);font-size:12px;padding:4px 8px;border-radius:8px" onclick="location.hash='#/'">🔄 Switch Role</button>
+      </div>
+    </div>
     <div class="stat-grid">
       ${statCard(sum.pending_receiving, "📥 Intake Pending")}
       ${statCard(sum.in_testing, "🧪 In Testing")}
@@ -1598,8 +1693,11 @@ function profileView(role) {
           <div><b>Specialization</b>${u.specialization || "General"}</div>
         </div>
       </div>
-      <div class="section-card">
+      <div class="section-card" style="display:flex;flex-direction:column;gap:10px">
+        <button class="btn btn-primary" onclick="location.hash='#/'">🔄 Switch Role / Portal</button>
         <button class="btn btn-outline" onclick="logout()">${t("btn.logout")}</button>
+        <button class="btn btn-ghost btn-sm" style="color:var(--red);margin-top:6px" onclick="clearAppCache()">🧹 Reset App Cache &amp; Session</button>
+        <div class="small-muted" style="text-align:center;margin-top:4px">PashuMitra v2.2.0 · Live dev mode</div>
       </div>
       ${bottomNav("")}
     `);
