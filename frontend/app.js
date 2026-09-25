@@ -9,7 +9,12 @@
 // 6. National Disease Intelligence & Surveillance Network
 // ==========================================================================
 
-const API = "/api";
+// API base URL. Default is same-origin ("/api") because this frontend is
+// served by the Flask backend itself — this works unchanged in local
+// development AND on Render. To point the frontend at a separately hosted
+// backend, set window.PASHU_API_BASE = "https://your-backend.onrender.com"
+// before this script loads.
+const API = (window.PASHU_API_BASE || "").replace(/\/+$/, "") + "/api";
 const ROLES = ["owner", "vet", "govt", "lab"];
 
 const state = {

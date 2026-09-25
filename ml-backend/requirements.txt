@@ -1,7 +1,18 @@
-fastapi
-uvicorn
-scikit-learn
-pandas
-numpy
-joblib
-pydantic
+# ---------------------------------------------------------------------------
+# Pashu-Shield ML backend (FastAPI) — Render Web Service
+# Root directory: ml-backend/
+# Build command: pip install -r requirements.txt
+# Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
+# Every package below is imported by ml-backend/main.py.
+# ---------------------------------------------------------------------------
+
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pydantic>=2.5,<3
+
+# IMPORTANT: models/*.pkl were trained/pickled with scikit-learn 1.9.1.
+# Loading them with an older scikit-learn can fail or misbehave, so keep >=1.9.1.
+scikit-learn>=1.9.1,<2
+joblib>=1.3,<2
+pandas>=2.2,<3.1
+numpy>=1.26,<3

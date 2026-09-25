@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import secrets
 import uuid
 import jwt
 import sqlite3
@@ -26,7 +27,9 @@ import animal_ai
 SECRET_KEY = os.environ.get("SIH_SECRET_KEY", "sih-hackathon-dev-secret-change-me")
 TOKEN_EXP_HOURS = 12
 
-FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
+# Absolute path to the bundled frontend (repo/frontend). Works regardless of
+# the current working directory (Render starts gunicorn from backend/).
+FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
 PORT = int(os.environ.get("PORT", "5001"))
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
@@ -176,6 +179,41 @@ def no_cache_static(resp):
 @app.route("/")
 def index():
     return send_from_directory(FRONTEND_DIR, "index.html")
+
+
+# ------------------------------------------------------------------ health --
+@app.get("/api/health")
+def health_check():
+    """Simple JSON health probe for uptime monitoring (used by Render)."""
+    return jsonify({"status": "ok", "service": "Pashu-Shield Backend"})
+
+
+# -------------------------------------------------------------------- CORS --
+# The bundled frontend is served by this same Flask app, so browser requests
+# are same-origin and no CORS headers are needed (default: disabled).
+# Only if you host the frontend on a DIFFERENT domain, set the
+# SIH_CORS_ORIGINS env var to a comma-separated list of allowed origins, e.g.
+#   SIH_CORS_ORIGINS=https://pashu-shield-frontend.onrender.com
+CORS_ORIGINS = {o.strip() for o in os.environ.get("SIH_CORS_ORIGINS", "").split(",") if o.strip()}
+
+
+@app.before_request
+def cors_preflight():
+    if CORS_ORIGINS and request.method == "OPTIONS":
+        return "", 204
+
+
+@app.after_request
+def apply_cors(resp):
+    if CORS_ORIGINS:
+        origin = request.headers.get("Origin", "")
+        if origin in CORS_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+            resp.headers["Vary"] = "Origin"
+    return resp
 
 
 # ------------------------------------------------------------------ auth --
@@ -2189,15 +2227,23 @@ def list_diseases():
 
 
 # ------------------------------------------------- AI early warning (govt) --
-ML_BACKEND = os.environ.get("SIH_ML_BACKEND", "http://127.0.0.1:8000")
+# ML backend base URL. Configured via the SIH_ML_BACKEND environment variable
+# on Render (e.g. https://pashu-shield-ml.onrender.com). Falls back to the
+# local development default when the variable is absent — the app still starts
+# and serves every non-AI endpoint; AI endpoints return a clear 503 instead.
+ML_BACKEND = (os.environ.get("SIH_ML_BACKEND") or "http://127.0.0.1:8000").rstrip("/")
 
 
 def _ml_post(path, payload):
     try:
         resp = requests.post(ML_BACKEND + path, json=payload, timeout=15)
-        return resp.json(), resp.status_code
+        try:
+            return resp.json(), resp.status_code
+        except ValueError:
+            return {"error": "AI service returned an invalid (non-JSON) response."}, 502
     except requests.RequestException:
-        return {"error": "AI service is not running. Start ml-backend (port 8000) and retry."}, 503
+        return {"error": "AI service is not reachable. Check the SIH_ML_BACKEND configuration "
+                         "(or start ml-backend locally on port 8000) and retry."}, 503
 
 
 def district_ai_features(conn, district):
@@ -2681,6 +2727,19 @@ def sync_queue():
     conn.commit()
     conn.close()
     return jsonify({"synced_count": len([r for r in results if r["status"] == "success"]), "results": results})
+
+
+# ------------------------------------------------------------------ startup --
+# When gunicorn imports this module (production on Render), the __main__ block
+# below never runs. init_db() is idempotent (CREATE TABLE IF NOT EXISTS plus
+# guarded seed data), so calling it here guarantees the SQLite schema exists
+# even if the deployed animal_health.db file is missing or fresh. The guard
+# ensures a transient race (e.g. two workers initialising a brand-new volume)
+# can never crash service startup.
+try:
+    init_db()
+except Exception as exc:  # pragma: no cover - startup resilience only
+    print("WARNING: database initialisation issue:", exc)
 
 
 if __name__ == "__main__":

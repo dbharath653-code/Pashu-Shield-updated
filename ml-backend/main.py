@@ -10,12 +10,27 @@ import os
 from datetime import datetime, timedelta
 from sklearn.cluster import DBSCAN
 
+# Anchor all file paths to this module's directory so the service works no
+# matter which working directory it is started from (Render starts uvicorn
+# from ml-backend/, but do not rely on that).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+
 app = FastAPI(title="Livestock Health Surveillance AI & Decision Support API")
 
+# CORS: the main Flask backend calls this service server-to-server, so no CORS
+# is strictly required. For optional direct browser access, set the
+# SIH_ML_ALLOWED_ORIGINS env var to a comma-separated list of origins, e.g.
+#   SIH_ML_ALLOWED_ORIGINS=https://pashu-shield-backend.onrender.com
+# When unset, any origin is allowed but WITHOUT credentials ("*" together with
+# credentials is rejected by browsers per the CORS spec).
+_allowed_origins = [
+    o.strip() for o in os.environ.get("SIH_ML_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allowed_origins if _allowed_origins else ["*"],
+    allow_credentials=bool(_allowed_origins),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -23,10 +38,10 @@ app.add_middleware(
 # Load existing models safely
 def load_models():
     try:
-        rf_model = joblib.load("models/rf_model.pkl")
-        scaler = joblib.load("models/scaler.pkl")
-        iso_model = joblib.load("models/iso_model.pkl")
-        with open("models/metrics.json", "r") as f:
+        rf_model = joblib.load(os.path.join(MODELS_DIR, "rf_model.pkl"))
+        scaler = joblib.load(os.path.join(MODELS_DIR, "scaler.pkl"))
+        iso_model = joblib.load(os.path.join(MODELS_DIR, "iso_model.pkl"))
+        with open(os.path.join(MODELS_DIR, "metrics.json"), "r") as f:
             metrics = json.load(f)
         return rf_model, scaler, iso_model, metrics
     except Exception as e:
@@ -34,6 +49,17 @@ def load_models():
         return None, None, None, None
 
 rf_model, scaler, iso_model, metrics = load_models()
+
+# ------------------------------------------------------------------ health --
+@app.get("/")
+async def root():
+    """Simple service banner so the deployed root URL answers HTTP 200."""
+    return {"status": "ok", "service": "Pashu-Shield ML Backend"}
+
+@app.get("/health")
+async def health():
+    """Lightweight health probe for uptime checks (Render health check path)."""
+    return {"status": "healthy"}
 
 FEATURE_COLS = [
     "animal_population", "affected_animals", "new_cases", "deaths", 
@@ -342,4 +368,5 @@ async def spatiotemporal_clustering(req: ClusterRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Local development only; production uses `uvicorn main:app --host 0.0.0.0 --port $PORT`.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

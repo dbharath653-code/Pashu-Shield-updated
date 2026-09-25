@@ -1,3 +1,30 @@
+# ---------------------------------------------------------------------------
+# Pashu-Shield main backend (Flask) — Render Web Service
+# Root directory: backend/
+# Build command: pip install -r requirements.txt
+# Start command: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+# Every package below is actually imported by backend/app.py (or its WSGI start
+# command). Keep this list in sync with the imports at the top of app.py.
+# ---------------------------------------------------------------------------
+
+# Production WSGI server (required by the Render start command: `gunicorn ...`)
+gunicorn>=23.0,<27
+
+# Web framework
 Flask==3.1.3
+
+# Auth tokens (jwt) / outbound HTTP (ML backend + Open-Meteo weather)
 PyJWT==2.9.0
-requests>=2.31.0
+requests>=2.31.0,<3
+
+# QR code generation (make_qr_image_data_url) — needs Pillow for PNG output
+qrcode>=7.4.2,<9
+
+# Imaging + QR decoding (decode_qr_image uses PIL + cv2.QRCodeDetector)
+Pillow>=10.4,<13
+opencv-python-headless>=4.10,<5
+numpy>=1.26,<3
+
+# DBSCAN disease clustering (in-process fallback when the ML backend is offline)
+# NOTE: ml-backend models are trained with scikit-learn 1.9.x — keep in sync.
+scikit-learn>=1.9.1,<2

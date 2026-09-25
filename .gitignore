@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 .DS_Store
+*.log
+.venv/
+venv/
+.env
+# SQLite WAL sidecar files created at runtime
+*.db-wal
+*.db-shm
