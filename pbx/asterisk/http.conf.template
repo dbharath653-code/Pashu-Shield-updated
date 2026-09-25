@@ -1,0 +1,5 @@
+; Pashu-Shield voice gateway - built-in HTTP stays OFF.
+[general]
+enabled = no
+bindaddr = 127.0.0.1
+bindport = 8088

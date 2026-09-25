@@ -187,6 +187,25 @@ check("vet availability restored AVAILABLE",
 r = requests.put(f"{BASE}/api/users/me", headers=H(tokens["owner"]), json={"availability_status": "BUSY"})
 check("owner cannot set availability -> 403", r.status_code == 403, f"{r.status_code} {r.text[:200]}")
 
+# --- Voice gateway (self-hosted PBX): health signals + auth boundary ---
+r = requests.get(f"{BASE}/api/ivr/health")
+_h = r.json() if r.status_code == 200 else {}
+check("GET /api/ivr/health has pbx/sip/pstn signals",
+      r.status_code == 200 and all(k in _h for k in
+      ("application", "ivr", "pbx", "sip_registered", "pstn_connected", "pbx_detail", "pstn_detail")),
+      f"{r.status_code} {r.text[:200]}")
+check("health honesty: app up does not imply pstn",
+      _h.get("application") is True and _h.get("ivr") is True
+      and isinstance(_h.get("pstn_connected"), bool), f"{r.text[:200]}")
+r = requests.post(f"{BASE}/api/ivr/gateway/heartbeat", json={"sip_registered": True})
+check("gateway heartbeat w/o secret -> 401", r.status_code == 401, f"{r.status_code} {r.text[:150]}")
+r = requests.post(f"{BASE}/api/ivr/gateway/authorize-dial",
+                  json={"call_sid": "VERIFY", "number": "+919999999999"})
+check("gateway authorize-dial w/o secret -> 401", r.status_code == 401, f"{r.status_code} {r.text[:150]}")
+r = requests.post(f"{BASE}/api/ivr/webhook/status",
+                  data={"CallSid": "VERIFY-HYPHEN", "CallStatus": "no-answer", "CallDuration": "7"})
+check("status callback accepts hyphenated no-answer", r.status_code == 200, f"{r.status_code} {r.text[:150]}")
+
 print(f"\n==== RESULT: {len(PASS)} passed, {len(FAIL)} failed ====")
 if FAIL:
     print("FAILURES:", FAIL)

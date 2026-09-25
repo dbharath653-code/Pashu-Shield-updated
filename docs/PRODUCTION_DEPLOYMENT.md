@@ -39,10 +39,10 @@ Prerequisites: the repo pushed to GitHub; a Render account (free tier works).
    | Variable | Value |
    |---|---|
    | `SIH_SECRET_KEY` | auto-generated (`generateValue`) — keep it |
-   | `IVR_PHONE_NUMBER` | your public PSTN number, E.164 (e.g. `+919000000000`) |
-   | `TELEPHONY_PROVIDER` | `mock` until a real provider is configured |
+   | `IVR_PHONE_NUMBER` | fixed helpline `7382210251` (pre-set by the Blueprint) |
+   | `TELEPHONY_PROVIDER` | `mock` until the SIP PBX + carrier trunk are live (then `sip`) |
    | `APP_BASE_URL` | `https://<backend-host>` (for IVR SMS location links) |
-   | Real telephony only | `TELEPHONY_ACCOUNT_ID`, `TELEPHONY_AUTH_TOKEN`, `TELEPHONY_PHONE_NUMBER`, `TELEPHONY_WEBHOOK_SECRET` |
+   | Real PSTN only | `PBX_WEBHOOK_SECRET`, `PBX_ALLOWED_IPS` (self-hosted PBX; see §4 + `docs/PSTN_SIP_PBX.md`) |
    | Optional | `OPENAI_API_KEY` (else rule-based IVR summaries are used) |
 3. Deploy. Render runs health checks on `/api/health` (backend) and `/health` (ML).
 4. Verify (replace hosts):
@@ -96,23 +96,40 @@ transport) is implemented and tested, but live cellular calls to 7382210251
 cannot reach the system — and `GET /api/ivr/info` honestly reports
 `"pstn_connected": false`. No Twilio/Exotel SDKs or credentials are used.
 
-## 4. IVR production wiring (Twilio / Exotel)
+## 4. IVR production wiring (self-hosted SIP PBX — no Twilio/Exotel)
 
-1. In the backend service environment, set `TELEPHONY_PROVIDER=twilio` (or
-   `exotel`) plus `TELEPHONY_ACCOUNT_ID`, `TELEPHONY_AUTH_TOKEN`,
-   `TELEPHONY_PHONE_NUMBER`, `TELEPHONY_WEBHOOK_SECRET`, `IVR_PHONE_NUMBER`.
-2. In the provider console, point the number's **voice webhook** (POST) to:
-   `https://<backend-host>/api/ivr/webhook/call`
-   and the **status callback** to:
+Real-PSTN termination for 7382210251 is provided by the self-hosted Asterisk
+voice gateway in `pbx/`, fed by a carrier SIP trunk. The web app stays on
+Render; the PBX runs on a small public-IP VM (§29 — Render cannot host
+SIP/RTP reliably). Full runbook: **`docs/PSTN_SIP_PBX.md`**.
+
+1. Provision the PBX VM and run `pbx/install.sh` (Asterisk + AGI gateway +
+   firewall + fail2ban + heartbeat). See `pbx/README.md`.
+2. In the backend service environment, set `TELEPHONY_PROVIDER=sip`,
+   `PBX_WEBHOOK_SECRET` (same 32+ byte hex as the PBX host) and
+   `PBX_ALLOWED_IPS` (PBX egress IP). `IVR_PHONE_NUMBER` stays `7382210251`.
+3. With the carrier: route the helpline DID to the PBX IP (checklist in
+   `docs/PSTN_SIP_PBX.md` §7-§8). Legacy Twilio/Exotel/Plivo provider classes
+   remain in the repo only as unused code paths — project policy forbids
+   telephony SaaS credentials.
+4. The PBX drives the existing webhooks itself (POST):
+   `https://<backend-host>/api/ivr/webhook/call` and status
    `https://<backend-host>/api/ivr/webhook/status`
-   (Legacy aliases `/api/ivr/webhook/incoming` and `/voice` also work.)
-3. Place a test call: language -> main menu -> vet option or report survey ->
-   confirm the report appears in govt/vet `IVR reports` and a case is created.
-4. Webhook signature verification is enforced whenever the provider is not
-   `mock`; rate limiting is 60 req/min per IP.
+   (legacy aliases `/api/ivr/webhook/incoming` and `/voice` also work),
+   plus secret-authenticated `POST /api/ivr/gateway/heartbeat` and
+   `POST /api/ivr/gateway/authorize-dial`.
+5. Place a real-mobile test call (§10 of `docs/PSTN_SIP_PBX.md`): language ->
+   main menu -> vet option or report survey -> confirm the report appears in
+   govt/vet `IVR reports` and a case is created. Only after a real call
+   arrives does `GET /api/ivr/health` report `pstn_connected:true`
+   (automatic — no manual flag exists).
+6. Webhook signature verification is enforced whenever the provider is not
+   `mock`; rate limiting is 60 req/min per IP; gateway endpoints fail closed
+   without the secret.
 
-Without provider credentials the IVR APIs still run in `mock` mode for
-testing (`POST /api/ivr/mock/call`), but no real phone calls can arrive.
+Without the carrier/PBX layer the IVR APIs still run in `mock` mode for
+testing (`POST /api/ivr/mock/call`), but no real phone calls can arrive —
+and `pstn_connected` honestly stays `false`.
 
 ## 5. Local / staging run (mirrors production)
 

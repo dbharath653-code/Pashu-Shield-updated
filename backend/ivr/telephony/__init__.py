@@ -16,6 +16,10 @@ def get_telephony_provider():
         # Plivo uses similar pattern to Twilio, reuse Twilio for now with note
         from .twilio_provider import TwilioProvider
         return TwilioProvider(TELEPHONY_ACCOUNT_ID, TELEPHONY_AUTH_TOKEN, TELEPHONY_PHONE_NUMBER)
+    elif provider_name == "sip":
+        # Self-hosted Asterisk PBX voice gateway (pbx/). No SaaS credentials.
+        from .sip_provider import SIPProvider
+        return SIPProvider()
     else:
         from .mock_provider import MockTelephonyProvider
         return MockTelephonyProvider(TELEPHONY_WEBHOOK_SECRET)

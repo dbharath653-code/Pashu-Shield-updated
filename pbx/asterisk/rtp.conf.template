@@ -1,0 +1,11 @@
+; Pashu-Shield voice gateway - RTP (TEMPLATE, rendered by install.sh).
+[general]
+; Small port range: easy to firewall. ~4 ports per concurrent call, so 100
+; ports comfortably serve this helpline's expected concurrency.
+rtpstart = {{RTP_PORT_START}}
+rtpend = {{RTP_PORT_END}}
+; Drop RTP from unexpected sources (abuse hardening).
+strictrtp = yes
+; No ICE/STUN: server-side trunking only.
+icesupport = no
+stunaddr =

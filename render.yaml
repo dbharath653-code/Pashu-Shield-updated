@@ -31,12 +31,20 @@ services:
           property: host
         # NOTE: Render `host` yields "https://<ml-host>"; no trailing path needed.
       # IVR Reporting Channel - extension, not rewrite
+      # mock = dev/tests. Production real-PSTN transport is `sip` (self-hosted
+      # Asterisk PBX in pbx/, carrier SIP trunk, no telephony SaaS).
       - key: TELEPHONY_PROVIDER
         value: mock
         sync: false
       # Official Pashu-Shield helpline (fixed). Editable in dashboard if it ever changes.
       - key: IVR_PHONE_NUMBER
         value: "7382210251"
+        sync: false
+      # Self-hosted voice gateway (TELEPHONY_PROVIDER=sip). Set the secret in
+      # the dashboard (32+ hex chars, must match the PBX host's pbx.env).
+      - key: PBX_WEBHOOK_SECRET
+        sync: false
+      - key: PBX_ALLOWED_IPS
         sync: false
       - key: TELEPHONY_ACCOUNT_ID
         sync: false

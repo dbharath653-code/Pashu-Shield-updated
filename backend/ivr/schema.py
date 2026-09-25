@@ -232,6 +232,17 @@ CREATE TABLE IF NOT EXISTS ivr_webhook_idempotency (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Voice-gateway (self-hosted PBX) state: heartbeats, SIP registration, and
+-- the honest first-real-inbound marker. pstn_connected is derived ONLY from
+-- first_real_inbound_at, which is set exclusively when an authenticated
+-- gateway delivers a real (non-mock) inbound call. No API can set it
+-- directly, and no config flag can fake it.
+CREATE TABLE IF NOT EXISTS ivr_gateway_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT '',
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_ivr_calls_sid ON ivr_calls(call_sid);
 CREATE INDEX IF NOT EXISTS idx_ivr_calls_caller ON ivr_calls(caller_number_normalized);

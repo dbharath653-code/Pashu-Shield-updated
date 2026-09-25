@@ -15,9 +15,14 @@ Set in Render Dashboard → Service → Environment (or `.env` locally):
 
 ```bash
 IVR_PHONE_NUMBER=7382210251            # Official Pashu-Shield helpline (also the app default)
-TELEPHONY_PROVIDER=twilio              # mock | twilio | exotel | plivo
-TELEPHONY_ACCOUNT_ID=ACxxxx            # Provider SID / API key
-TELEPHONY_AUTH_TOKEN=...               # Provider auth token (never commit)
+TELEPHONY_PROVIDER=sip                 # mock | sip | twilio | exotel | plivo
+# --- project policy: production uses the self-hosted SIP PBX (pbx/) ---
+# --- Twilio/Exotel/Plivo provider classes remain only as legacy code paths ---
+PBX_WEBHOOK_SECRET=...                 # REQUIRED in sip mode: 32+ hex chars, shared with the PBX host
+PBX_ALLOWED_IPS=203.0.113.10           # Recommended: PBX egress IP(s) for /api/ivr/gateway/*
+PBX_HEARTBEAT_STALE_SECONDS=300        # Freshness window for pbx_healthy
+TELEPHONY_ACCOUNT_ID=ACxxxx            # Legacy SaaS providers only (not used by project policy)
+TELEPHONY_AUTH_TOKEN=...               # Legacy SaaS providers only (never commit)
 TELEPHONY_WEBHOOK_SECRET=...           # HMAC secret for X-Twilio-Signature / X-Exotel-Signature verification
 TELEPHONY_PHONE_NUMBER=+919000000000   # Optional override (defaults to IVR_PHONE_NUMBER)
 OPENAI_API_KEY=sk-...                  # Optional; if absent, rule-based summarizer used (no hallucination)
@@ -29,7 +34,7 @@ IVR_RATE_LIMIT_PER_MINUTE=60
 SIH_SECRET_KEY=<generateValue>
 ```
 
-**Provider abstraction:** `backend/ivr/telephony/factory.py` selects `MockProvider` | `TwilioProvider` | `ExotelProvider` based on `TELEPHONY_PROVIDER`. Only credentials change — no code change required. Add a new provider by implementing `TelephonyProvider` (`make_call`, `verify_signature`, `generate_twiml`, `get_recording`).
+**Provider abstraction:** `backend/ivr/telephony/__init__.py:get_telephony_provider()` selects `MockTelephonyProvider` | `SIPProvider` | `TwilioProvider` | `ExotelProvider` based on `TELEPHONY_PROVIDER`. Only configuration changes — no code change required. Production transport is **`sip`** (self-hosted Asterisk PBX in `pbx/`, fed by a carrier SIP trunk — see `docs/PSTN_SIP_PBX.md`); `mock` remains for dev/tests. Add a new provider by subclassing `BaseTelephonyProvider` (`generate_*_twiml`, `verify_webhook_signature`, `normalize_phone`, `initiate_outbound_call`, `get_recording_url`).
 
 ## 3. Webhook URL (HTTPS)
 
@@ -43,9 +48,9 @@ https://<your-backend-host>/api/ivr/webhook/status   (status callback)
 (Legacy aliases `/api/ivr/webhook/incoming` and `/api/ivr/webhook/voice` serve the same handler.)
 
 - Must be HTTPS with valid certificate (provider requirement).
-- Example (Twilio): Console → Phone Numbers → Active Numbers → Select `IVR_PHONE_NUMBER` → Voice Configuration → Webhook `https://.../api/ivr/webhook/call` (POST), Status Callback `https://.../api/ivr/webhook/status`.
-- Example (Exotel): Exotel Dashboard → App Bazaar → IVR App → Connect → URL `https://.../api/ivr/webhook/call`.
-- Health check: `GET /api/ivr/health` returns `{ status: "degraded" | "healthy", missing_env: [...], provider_ready }`.
+- **Production (project policy):** the self-hosted PBX drives these webhooks — no SaaS console involved. Full runbook: `docs/PSTN_SIP_PBX.md` (carrier checklist, PBX install, firewall, testing, rollback).
+- Legacy examples (not used by project policy): Twilio Console → Phone Numbers → Voice Configuration → Webhook `https://.../api/ivr/webhook/call` (POST), Status Callback `https://.../api/ivr/webhook/status`; Exotel Dashboard → App Bazaar → IVR App → URL `https://.../api/ivr/webhook/call`.
+- Health check: `GET /api/ivr/health` returns `{ status, application, ivr, pbx, pbx_detail, sip_registered, pstn_connected, pstn_detail, config, missing_env, provider_ready }`. `pstn_connected` turns true automatically only after an authenticated real inbound call arrives; heartbeats alone never set it.
 
 ## 4. HTTPS & Reverse Proxy
 

@@ -1,0 +1,8 @@
+; Pashu-Shield voice gateway - logging (fail2ban reads `security`).
+[general]
+dateformat = %F %T
+
+[logfiles]
+messages => notice,warning,error,security
+security => security
+full => notice,warning,error,debug,verbose

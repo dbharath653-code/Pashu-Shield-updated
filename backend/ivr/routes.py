@@ -120,8 +120,21 @@ def register_ivr_routes(app):
     @app.route("/api/ivr/webhook/incoming", methods=["POST", "GET"])
     @verify_telephony_signature
     def ivr_incoming():
+        from .services import gateway as _gw
         provider_name = os.environ.get("TELEPHONY_PROVIDER", "mock")
         provider = get_telephony_provider()
+        # Real-inbound detection (independent of TELEPHONY_PROVIDER): the
+        # self-hosted PBX gateway declares transport=sip AND presents the
+        # gateway secret. Either one missing -> NOT a real inbound call and
+        # nothing here can mark pstn_connected.
+        try:
+            _transport = ((request.form.get("transport") or request.args.get("transport")
+                           or (request.get_json(silent=True) or {}).get("transport") or "").lower())
+        except Exception:
+            _transport = ""
+        is_gateway_call = _transport in ("sip", "pbx", "pstn") and _gw.gateway_authenticated(request)
+        if is_gateway_call:
+            provider_name = "sip"
         # Extract caller and called numbers
         caller = extract_caller_from_request(request)
         if not caller:
@@ -150,8 +163,9 @@ def register_ivr_routes(app):
             conn.close()
             return Response(twiml, mimetype="text/xml")
 
-        # Determine is_mock
-        is_mock = provider_name == "mock" or request.headers.get("X-Mock-Call") == "true" or "MOCK" in call_sid
+        # Determine is_mock (gateway-authenticated real calls are never mock)
+        is_mock = (not is_gateway_call) and (
+            provider_name == "mock" or request.headers.get("X-Mock-Call") == "true" or "MOCK" in call_sid)
         try:
             create_call_record(conn, provider_name, from_norm or raw_from, to_number, call_sid=call_sid, is_mock=is_mock)
         except Exception as e:
@@ -162,6 +176,14 @@ def register_ivr_routes(app):
         if from_norm:
             conn.execute("UPDATE ivr_calls SET caller_number_normalized=?, caller_number=? WHERE call_sid=?", (from_norm, raw_from, call_sid))
             conn.commit()
+
+        # Honest PSTN marker: ONLY an authenticated gateway delivering a real
+        # (non-mock) inbound call flips pstn_connected, via first_real_inbound.
+        if is_gateway_call and not is_mock:
+            try:
+                _gw.record_real_inbound(conn, call_sid, from_norm or raw_from, to_number)
+            except Exception:
+                pass
 
         # Helpline: identify registered farmer; skip the language prompt when
         # the farmer's preferred language is already known.
@@ -319,7 +341,10 @@ def register_ivr_routes(app):
                     # For real, ask consent
                     try:
                         from .telephony.mock_provider import MockTelephonyProvider
-                        if isinstance(provider, MockTelephonyProvider):
+                        # Exact-type check: SIPProvider reuses the mock TwiML
+                        # generators but is a REAL transport, so the farmer
+                        # must actually press 1/2 for recording consent.
+                        if type(provider) is MockTelephonyProvider:
                             # In mock, simulate consent = yes
                             vet_call_connected(conn, call_sid, vet["id"], vet_call_sid=f"VET-{uuid.uuid4().hex[:8]}")
                             twiml = provider.generate_connect_vet_twiml(call_sid, vet["mobile"], lang)
@@ -633,8 +658,10 @@ def register_ivr_routes(app):
             duration = 0
         conn = get_db()
         if call_sid:
-            # Normalize status to DB enum (uppercase)
-            status_norm = (status or "COMPLETED").upper()
+            # Normalize status to DB enum (uppercase, hyphens->underscores:
+            # real providers send "no-answer"/"in-progress", which must NOT
+            # corrupt into COMPLETED).
+            status_norm = (status or "COMPLETED").upper().replace("-", "_")
             if status_norm not in ('INITIATED','RINGING','IN_PROGRESS','COMPLETED','FAILED','NO_ANSWER','BUSY','CANCELED'):
                 status_norm = "COMPLETED"
             conn.execute("UPDATE ivr_calls SET status=?, duration_seconds=?, ended_at=datetime('now'), updated_at=datetime('now') WHERE call_sid=?", (status_norm, duration, call_sid))
@@ -653,8 +680,12 @@ def register_ivr_routes(app):
                                     create_ivr_report_from_survey(conn, call_sid, responses, language=session.get("language","en"), caller_phone=call["caller_number_normalized"] or "", duration_seconds=duration, is_partial=True)
                                 except Exception as e:
                                     print(e)
-                        elif session.get("vet_connected"):
-                            # Vet call completed without survey - create transcript-based report if transcripts exist
+                        elif session.get("vet_connected") and status_norm == "COMPLETED":
+                            # Vet leg actually answered (COMPLETED) without survey -
+                            # create transcript-based report if transcripts exist.
+                            # NO_ANSWER/BUSY/CANCELED/FAILED legs must NOT fabricate
+                            # a "consultation completed" report; the survey
+                            # fallback creates the real report instead.
                             transcripts = conn.execute("SELECT text_original FROM ivr_transcripts WHERE call_sid=?", (call_sid,)).fetchall()
                             full_transcript = " ".join([t["text_original"] for t in transcripts if t["text_original"]])
                             if full_transcript:
@@ -989,14 +1020,100 @@ def register_ivr_routes(app):
     @app.route("/api/ivr/health", methods=["GET"])
     def ivr_health():
         from .config import get_ivr_config_summary, validate_required_config, is_provider_configured
+        from .services import gateway as _gw
         missing = validate_required_config()
+        conn = get_db()
+        try:
+            gw = _gw.gateway_health(conn)
+            pstn = _gw.pstn_status(conn)
+        except Exception:
+            gw = {"pbx_healthy": False, "pbx_last_heartbeat_at_utc": None,
+                  "pbx_last_heartbeat_age_s": None, "pbx_host": None,
+                  "sip_registered": False, "sip_trunk": None}
+            pstn = {"pstn_connected": False, "first_real_inbound_at_utc": None,
+                    "first_real_inbound_sid": None}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        # Distinct liveness signals: the application/IVR being up says NOTHING
+        # about the voice path. pbx/sip/pstn are true only when verified:
+        # heartbeats for pbx/sip, an actual authenticated inbound call for pstn.
         return jsonify({
             "status": "ok" if not missing else "degraded",
+            "application": True,
+            "ivr": True,
+            "pbx": gw["pbx_healthy"],
+            "pbx_detail": gw,
+            "sip_registered": gw["sip_registered"],
+            "pstn_connected": pstn["pstn_connected"],
+            "pstn_detail": pstn,
             "config": get_ivr_config_summary(),
             "missing_env": missing,
             "provider_ready": is_provider_configured(),
             "version": "1.0-ivr",
         })
+
+    # -------------------- VOICE GATEWAY (self-hosted PBX) --------------------
+    # Secret-authenticated endpoints for the Asterisk gateway in pbx/ ONLY.
+    # Never uses the permissive mock signature path: gateway auth fails closed
+    # when PBX_WEBHOOK_SECRET is unset.
+    @app.route("/api/ivr/gateway/heartbeat", methods=["POST"])
+    def gateway_heartbeat():
+        from .services import gateway as _gw
+        ip = request.remote_addr or "unknown"
+        if is_rate_limited(ip, IVR_RATE_LIMIT_PER_MINUTE):
+            return jsonify({"error": "Rate limit exceeded"}), 429
+        if not _gw.gateway_ip_allowed(request):
+            return jsonify({"error": "Forbidden"}), 403
+        if not _gw.gateway_authenticated(request):
+            return jsonify({"error": "Invalid gateway credentials"}), 401
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            data = {}
+        conn = get_db()
+        try:
+            summary = _gw.record_heartbeat(conn, data)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({"ok": True, **summary})
+
+    @app.route("/api/ivr/gateway/authorize-dial", methods=["POST"])
+    def gateway_authorize_dial():
+        from .services import gateway as _gw
+        ip = request.remote_addr or "unknown"
+        if is_rate_limited(ip, IVR_RATE_LIMIT_PER_MINUTE):
+            return jsonify({"error": "Rate limit exceeded"}), 429
+        if not _gw.gateway_ip_allowed(request):
+            return jsonify({"error": "Forbidden"}), 403
+        if not _gw.gateway_authenticated(request):
+            return jsonify({"error": "Invalid gateway credentials"}), 401
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            data = {}
+        call_sid = data.get("call_sid") or ""
+        number = data.get("number") or ""
+        conn = get_db()
+        try:
+            decision = _gw.authorize_dial_number(conn, call_sid, number)
+            try:
+                conn.execute(
+                    "INSERT INTO ivr_events (call_sid, event_type, details, actor) VALUES (?,?,?,?)",
+                    (call_sid, "DIAL_AUTHORIZE",
+                     json.dumps({"number_last4": (number or "")[-4:], "allowed": decision.get("allowed")}), "pbx-gateway"))
+                conn.commit()
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify(decision), (200 if decision.get("allowed") else 403)
 
     # -------------------- MOCK / DEV helpers --------------------
     @app.route("/api/ivr/mock/call", methods=["POST"])
