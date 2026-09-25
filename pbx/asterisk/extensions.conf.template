@@ -1,0 +1,42 @@
+; Pashu-Shield voice gateway - dialplan (TEMPLATE).
+; Rendered by pbx/install.sh - DO NOT edit the rendered file by hand.
+;
+; INBOUND ONLY. The only callable path answers the helpline DID and hands the
+; channel to the Pashu-Shield AGI (pure transport: it drives the existing IVR
+; webhooks and executes the returned TwiML). No IVR logic lives here.
+;
+; There is intentionally NO outbound dialplan context. Vet legs are dialled by
+; the AGI with a direct trunk dial-string (PJSIP/<n>@carrier-trunk) after
+; per-call backend authorization - unreachable from any dialplan entry point.
+
+[pashu-inbound]
+; Carrier sends the called DID in various formats (7382210251 / 917382210251 /
+; +917382210251). Normalize the last 10 digits and enforce the helpline DID.
+exten => _X.,1,NoOp(PASHU inbound from ${CALLERID(num)} to ${EXTEN} dnid=${DNID})
+ same => n,Set(PASHU_CALLED_RAW=${DNID})
+ same => n,ExecIf($["${PASHU_CALLED_RAW}" = ""]?Set(PASHU_CALLED_RAW=${EXTEN}))
+ same => n,Set(PASHU_CALLED=${FILTER(0-9,${PASHU_CALLED_RAW})})
+ same => n,Set(PASHU_CALLED=${PASHU_CALLED:-10})
+ same => n,GotoIf($["${PASHU_CALLED}" != "{{PBX_DID_LAST10}}"]?wrong-did,1)
+ same => n,Set(PASHU_CALL_SID=)
+ same => n,AGI(pashu_ivr.py)
+ same => n,Hangup()
+
+; Any non-helpline DID arriving on the trunk is rejected (not our number).
+exten => wrong-did,1,NoOp(PASHU rejecting non-helpline DID ${PASHU_CALLED})
+ same => n,Playback(ss-noservice)
+ same => n,Hangup()
+
+; Hangup backstop: guarantees the backend learns the call ended even if the
+; main AGI died mid-call. PASHU_CALL_SID is set by pashu_ivr.py at answer.
+exten => h,1,AGI(pashu_hangup.py,${PASHU_CALL_SID})
+ same => n,Hangup()
+
+; Deny-all defaults: unauthenticated SIP peers land here and are dropped.
+[default]
+exten => _X.,1,NoOp(PASHU deny-all default context)
+ same => n,Hangup()
+
+[public]
+exten => _X.,1,NoOp(PASHU deny-all public context)
+ same => n,Hangup()

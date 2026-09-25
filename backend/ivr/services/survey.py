@@ -51,18 +51,21 @@ def should_ask_pregnancy(responses: Dict[str, Any]) -> bool:
     species = (responses.get("species") or "").lower()
     return species in ("cattle", "buffalo", "goat", "sheep", "cow", "cattle/buffalo")
 
-def should_skip_question(key: str, responses: Dict[str, Any]) -> bool:
+def should_skip_question(key: str, responses: Dict[str, Any], prefilled_keys=None) -> bool:
     if key == "pregnancy" and not should_ask_pregnancy(responses):
+        return True
+    # Skip questions already answered from the verified farmer profile.
+    if prefilled_keys and key in set(prefilled_keys):
         return True
     # If no vaccination info, don't repeatedly ask (already asked once, but conditional handled elsewhere)
     return False
 
-def get_next_question_index(current_index: int, responses: Dict[str, Any]) -> int:
-    """Get next question index skipping conditionals."""
+def get_next_question_index(current_index: int, responses: Dict[str, Any], prefilled_keys=None) -> int:
+    """Get next question index skipping conditionals and profile-prefilled answers."""
     next_idx = current_index + 1
     while next_idx < len(SURVEY_QUESTION_KEYS):
         key = SURVEY_QUESTION_KEYS[next_idx]
-        if should_skip_question(key, responses):
+        if should_skip_question(key, responses, prefilled_keys):
             next_idx += 1
             continue
         break

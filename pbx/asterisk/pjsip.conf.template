@@ -1,0 +1,92 @@
+; Pashu-Shield voice gateway - PJSIP config (TEMPLATE).
+; Rendered by pbx/install.sh from /etc/pashu-pbx/pbx.env - DO NOT edit the
+; rendered /etc/asterisk/pjsip.conf by hand.
+;
+; Design: INBOUND ONLY from the carrier trunk. There are no local SIP phones,
+; no dialplan outbound context, and vet legs are placed by the AGI over this
+; same trunk endpoint (PJSIP/<vet>@carrier-trunk) only after per-call backend
+; authorization. There is no way to dial out except via the backend-approved
+; vet number of a live inbound call.
+
+; ---------------- transports ----------------
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+; NAT: if this host sits behind NAT set PBX_PUBLIC_IP / PBX_LOCALNETS.
+{{#IF PBX_PUBLIC_IP}}
+external_media_address = {{PBX_PUBLIC_IP}}
+external_signaling_address = {{PBX_PUBLIC_IP}}
+{{/IF}}
+{{#IF PBX_LOCALNETS}}
+local_net = {{PBX_LOCALNETS}}
+{{/IF}}
+
+{{#IF PBX_TLS_CERT}}
+[transport-tls]
+type = transport
+protocol = tls
+bind = 0.0.0.0:5061
+cert_file = {{PBX_TLS_CERT}}
+priv_key_file = {{PBX_TLS_KEY}}
+method = tlsv1_2
+{{/IF}}
+
+; ---------------- carrier trunk endpoint ----------------
+; The carrier delivers helpline calls for {{PBX_DID}} to this box.
+[carrier-trunk]
+type = endpoint
+context = pashu-inbound
+disallow = all
+allow = ulaw,alaw
+; g722 only if your carrier negotiates wideband; ulaw/alaw always work in IN.
+{{#IF PBX_ALLOW_G722}}
+allow = g722
+{{/IF}}
+direct_media = no
+dtmf_mode = rfc4733
+; Trust carrier caller ID (From / P-Asserted-Identity / Remote-Party-ID).
+trust_id_inbound = yes
+send_pai = yes
+; NAT traversal helpers (harmless on a public-IP host).
+force_rport = yes
+rewrite_contact = yes
+rtp_symmetric = yes
+; Outbound (vet-leg) authentication on the same trunk.
+outbound_auth = carrier-auth
+aors = carrier-aor
+; Media security: enable ONLY if the carrier supports it (most IN trunks don't).
+{{#IF PBX_SRTP}}
+media_encryption = sdes
+{{/IF}}
+
+[carrier-auth]
+type = auth
+auth_type = userpass
+username = {{SIP_USERNAME}}
+password = {{SIP_PASSWORD}}
+
+[carrier-aor]
+type = aor
+contact = sip:{{SIP_TRUNK_HOST}}:{{SIP_TRUNK_PORT}}
+qualify_frequency = 60
+
+; Accept inbound SIP ONLY from the carrier's signalling IPs.
+[carrier-identify]
+type = identify
+endpoint = carrier-trunk
+match = {{CARRIER_SIP_IPS}}
+
+{{#IF PBX_SIP_REGISTER}}
+; Registration-based trunk (some carriers require us to REGISTER).
+[carrier-reg]
+type = registration
+transport = transport-udp
+outbound_auth = carrier-auth
+server_uri = sip:{{SIP_TRUNK_HOST}}:{{SIP_TRUNK_PORT}}
+client_uri = sip:{{SIP_USERNAME}}@{{SIP_TRUNK_HOST}}:{{SIP_TRUNK_PORT}}
+contact_user = pashu
+retry_interval = 60
+forbidden_retry_interval = 120
+expiration = 300
+{{/IF}}

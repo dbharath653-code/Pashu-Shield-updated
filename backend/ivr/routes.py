@@ -21,9 +21,11 @@ def register_ivr_routes(app):
         create_call_record, get_session, get_call, update_session_state,
         set_language, handle_menu_choice, find_available_vet, is_vet_available,
         record_survey_answer, advance_survey, get_all_responses_dict,
-        handle_call_end, vet_call_connected
+        handle_call_end, vet_call_connected, identify_and_link_caller,
+        apply_known_language, set_routing_status, rank_vets_for_call
     )
-    from .services.survey import SURVEY_QUESTION_KEYS, CHOICE_MAPS
+    from .services.survey import SURVEY_QUESTION_KEYS, CHOICE_MAPS, get_next_question_index
+    from .services.farmer import identify_farmer, build_prefill, apply_prefill, get_prefilled_keys
     from .services.location import get_location_from_responses
     from .services.report_service import create_ivr_report_from_survey, update_report_status
     from .services.security import is_rate_limited
@@ -118,8 +120,21 @@ def register_ivr_routes(app):
     @app.route("/api/ivr/webhook/incoming", methods=["POST", "GET"])
     @verify_telephony_signature
     def ivr_incoming():
+        from .services import gateway as _gw
         provider_name = os.environ.get("TELEPHONY_PROVIDER", "mock")
         provider = get_telephony_provider()
+        # Real-inbound detection (independent of TELEPHONY_PROVIDER): the
+        # self-hosted PBX gateway declares transport=sip AND presents the
+        # gateway secret. Either one missing -> NOT a real inbound call and
+        # nothing here can mark pstn_connected.
+        try:
+            _transport = ((request.form.get("transport") or request.args.get("transport")
+                           or (request.get_json(silent=True) or {}).get("transport") or "").lower())
+        except Exception:
+            _transport = ""
+        is_gateway_call = _transport in ("sip", "pbx", "pstn") and _gw.gateway_authenticated(request)
+        if is_gateway_call:
+            provider_name = "sip"
         # Extract caller and called numbers
         caller = extract_caller_from_request(request)
         if not caller:
@@ -148,8 +163,9 @@ def register_ivr_routes(app):
             conn.close()
             return Response(twiml, mimetype="text/xml")
 
-        # Determine is_mock
-        is_mock = provider_name == "mock" or request.headers.get("X-Mock-Call") == "true" or "MOCK" in call_sid
+        # Determine is_mock (gateway-authenticated real calls are never mock)
+        is_mock = (not is_gateway_call) and (
+            provider_name == "mock" or request.headers.get("X-Mock-Call") == "true" or "MOCK" in call_sid)
         try:
             create_call_record(conn, provider_name, from_norm or raw_from, to_number, call_sid=call_sid, is_mock=is_mock)
         except Exception as e:
@@ -161,14 +177,57 @@ def register_ivr_routes(app):
             conn.execute("UPDATE ivr_calls SET caller_number_normalized=?, caller_number=? WHERE call_sid=?", (from_norm, raw_from, call_sid))
             conn.commit()
 
-        # Generate welcome + language selection
-        twiml = provider.generate_welcome_twiml(call_sid, "en")
+        # Honest PSTN marker: ONLY an authenticated gateway delivering a real
+        # (non-mock) inbound call flips pstn_connected, via first_real_inbound.
+        if is_gateway_call and not is_mock:
+            try:
+                _gw.record_real_inbound(conn, call_sid, from_norm or raw_from, to_number)
+            except Exception:
+                pass
+
+        # Helpline: identify registered farmer; skip the language prompt when
+        # the farmer's preferred language is already known.
+        try:
+            farmer = identify_and_link_caller(conn, call_sid)
+        except Exception:
+            farmer = None
+        known_lang = None
+        if farmer:
+            try:
+                known_lang = apply_known_language(conn, call_sid, farmer)
+            except Exception:
+                known_lang = None
+        if known_lang:
+            # Welcome + main menu in the known language (no re-ask).
+            say_hi = provider._say(f"{t('welcome', known_lang)} {t('language_confirm', known_lang)}", known_lang)
+            say_menu = provider._say(t("main_menu", known_lang), known_lang)
+            gather = provider._gather(say_menu, action=f"/api/ivr/webhook/menu?call_sid={call_sid}", num_digits=1, timeout=10, input_type="dtmf speech")
+            redirect = provider._redirect(f"/api/ivr/webhook/menu?call_sid={call_sid}")
+            twiml = provider._wrap_response(say_hi + gather + redirect)
+            try:
+                from .services.call_service import get_session as _gs
+                _sess = _gs(conn, call_sid)
+                conn.execute("INSERT INTO ivr_events (call_sid, session_id, event_type, details) VALUES (?,?,?,?)",
+                             (call_sid, _sess["id"] if _sess else None, "LANGUAGE_SKIPPED_KNOWN",
+                              json.dumps({"language": known_lang})))
+                conn.commit()
+            except Exception:
+                pass
+        else:
+            # Generate welcome + language selection
+            twiml = provider.generate_welcome_twiml(call_sid, "en")
         conn.close()
         return Response(twiml, mimetype="text/xml")
 
     # Alternative: Twilio often POSTs to root webhook, alias
     @app.route("/api/ivr/webhook/voice", methods=["POST", "GET"])
     def ivr_voice_alias():
+        return ivr_incoming()
+
+    # Canonical production webhook documented in docs/IVR_DEPLOYMENT.md.
+    # Telephony providers (Twilio/Exotel) are configured with this URL.
+    @app.route("/api/ivr/webhook/call", methods=["POST", "GET"])
+    def ivr_call_alias():
         return ivr_incoming()
 
     @app.route("/api/ivr/webhook/welcome", methods=["POST", "GET"])
@@ -243,17 +302,37 @@ def register_ivr_routes(app):
 
         choice = handle_menu_choice(conn, call_sid, raw_input, lang)
         if choice == "vet":
-            # Check vet availability
-            # Try to get district from caller if known, else generic
+            # Regional routing: district + language + existing assignment + load.
             call = get_call(conn, call_sid)
+            session = get_session(conn, call_sid)
             district = None
-            # Try to infer district from caller's user profile if number matches
+            caller_user_id = session.get("caller_user_id") if session else None
+            # Prefer the identified session region, then caller profile district.
+            try:
+                if session and session.get("region"):
+                    district = (json.loads(session["region"]) or {}).get("district") or None
+            except Exception:
+                district = None
+            if not district or district == "Not provided":
+                district = None
             caller_norm = call["caller_number_normalized"] if call else ""
-            if caller_norm:
+            if not district and caller_norm:
                 user = conn.execute("SELECT district FROM users WHERE mobile=?", (caller_norm,)).fetchone()
                 if user and user["district"]:
                     district = user["district"]
-            vet = find_available_vet(conn, district)
+            set_routing_status(conn, call_sid, "ROUTING", {"district": district, "language": lang})
+            ranked = rank_vets_for_call(conn, district, lang, caller_user_id)
+            vet = next((r for r in ranked if r["selectable"]), None)
+            try:
+                conn.execute("INSERT INTO ivr_events (call_sid, session_id, event_type, details) VALUES (?,?,?,?)",
+                             (call_sid, session["id"] if session else None, "ROUTING_DECISION",
+                              json.dumps({"district": district, "language": lang,
+                                          "selected_vet_id": vet["id"] if vet else None,
+                                          "candidates": [{"vet_id": r["id"], "availability": r["availability"],
+                                                          "score": r["score"], "reasons": r["reasons"]} for r in ranked]})))
+                conn.commit()
+            except Exception:
+                pass
             if vet and is_vet_available(conn, vet):
                 # Check recording consent if required
                 if IVR_RECORDING_ENABLED and IVR_RECORDING_CONSENT_REQUIRED:
@@ -262,7 +341,10 @@ def register_ivr_routes(app):
                     # For real, ask consent
                     try:
                         from .telephony.mock_provider import MockTelephonyProvider
-                        if isinstance(provider, MockTelephonyProvider):
+                        # Exact-type check: SIPProvider reuses the mock TwiML
+                        # generators but is a REAL transport, so the farmer
+                        # must actually press 1/2 for recording consent.
+                        if type(provider) is MockTelephonyProvider:
                             # In mock, simulate consent = yes
                             vet_call_connected(conn, call_sid, vet["id"], vet_call_sid=f"VET-{uuid.uuid4().hex[:8]}")
                             twiml = provider.generate_connect_vet_twiml(call_sid, vet["mobile"], lang)
@@ -290,6 +372,7 @@ def register_ivr_routes(app):
                     twiml = provider._wrap_response(say + redirect)
                 # Auto-mark survey started
                 update_session_state(conn, call_sid, "SURVEY", extra={"survey_started": 1, "current_question_key": SURVEY_QUESTION_KEYS[0], "current_question_index": 0})
+                set_routing_status(conn, call_sid, "VET_UNAVAILABLE", {"district": district})
                 # Also enqueue that we attempted vet connection
                 conn.execute("INSERT INTO ivr_events (call_sid, event_type, details) VALUES (?,?,?)",
                              (call_sid, "VET_UNAVAILABLE", json.dumps({"district": district})))
@@ -357,7 +440,35 @@ def register_ivr_routes(app):
         # Ensure session is in SURVEY
         if not session or session["current_state"] != "SURVEY":
             update_session_state(conn, call_sid, "SURVEY", language=lang, extra={"survey_started": 1, "current_question_key": SURVEY_QUESTION_KEYS[0], "current_question_index": 0})
-        twiml = provider.generate_survey_question_twiml(call_sid, SURVEY_QUESTION_KEYS[0], lang, attempt=0)
+            session = get_session(conn, call_sid)
+        set_routing_status(conn, call_sid, "SURVEY_STARTED")
+        # Helpline: prefill verified profile facts so known questions are skipped.
+        first_key = SURVEY_QUESTION_KEYS[0]
+        try:
+            call = get_call(conn, call_sid)
+            farmer = identify_farmer(conn, (call or {}).get("caller_number_normalized") or "")
+            if farmer:
+                if not (session or {}).get("caller_user_id"):
+                    conn.execute("UPDATE ivr_sessions SET caller_user_id=? WHERE call_sid=?",
+                                 (farmer["user_id"], call_sid))
+                    conn.commit()
+                skipped = apply_prefill(conn, call_sid, build_prefill(conn, farmer), lang)
+                if skipped:
+                    responses = get_all_responses_dict(conn, call_sid)
+                    prefilled = get_prefilled_keys(conn, call_sid)
+                    idx = get_next_question_index(-1, responses, prefilled)
+                    if idx < len(SURVEY_QUESTION_KEYS):
+                        first_key = SURVEY_QUESTION_KEYS[idx]
+                        update_session_state(conn, call_sid, "SURVEY",
+                                             extra={"current_question_key": first_key,
+                                                    "current_question_index": idx, "retry_count": 0})
+                    conn.execute("INSERT INTO ivr_events (call_sid, session_id, event_type, details) VALUES (?,?,?,?)",
+                                 (call_sid, (session or {}).get("id"), "SURVEY_PREFILLED",
+                                  json.dumps({"skipped": skipped, "first_question": first_key})))
+                    conn.commit()
+        except Exception as e:
+            print(f"survey prefill failed (non-fatal): {e}")
+        twiml = provider.generate_survey_question_twiml(call_sid, first_key, lang, attempt=0)
         conn.close()
         return Response(twiml, mimetype="text/xml")
 
@@ -547,8 +658,10 @@ def register_ivr_routes(app):
             duration = 0
         conn = get_db()
         if call_sid:
-            # Normalize status to DB enum (uppercase)
-            status_norm = (status or "COMPLETED").upper()
+            # Normalize status to DB enum (uppercase, hyphens->underscores:
+            # real providers send "no-answer"/"in-progress", which must NOT
+            # corrupt into COMPLETED).
+            status_norm = (status or "COMPLETED").upper().replace("-", "_")
             if status_norm not in ('INITIATED','RINGING','IN_PROGRESS','COMPLETED','FAILED','NO_ANSWER','BUSY','CANCELED'):
                 status_norm = "COMPLETED"
             conn.execute("UPDATE ivr_calls SET status=?, duration_seconds=?, ended_at=datetime('now'), updated_at=datetime('now') WHERE call_sid=?", (status_norm, duration, call_sid))
@@ -567,8 +680,12 @@ def register_ivr_routes(app):
                                     create_ivr_report_from_survey(conn, call_sid, responses, language=session.get("language","en"), caller_phone=call["caller_number_normalized"] or "", duration_seconds=duration, is_partial=True)
                                 except Exception as e:
                                     print(e)
-                        elif session.get("vet_connected"):
-                            # Vet call completed without survey - create transcript-based report if transcripts exist
+                        elif session.get("vet_connected") and status_norm == "COMPLETED":
+                            # Vet leg actually answered (COMPLETED) without survey -
+                            # create transcript-based report if transcripts exist.
+                            # NO_ANSWER/BUSY/CANCELED/FAILED legs must NOT fabricate
+                            # a "consultation completed" report; the survey
+                            # fallback creates the real report instead.
                             transcripts = conn.execute("SELECT text_original FROM ivr_transcripts WHERE call_sid=?", (call_sid,)).fetchall()
                             full_transcript = " ".join([t["text_original"] for t in transcripts if t["text_original"]])
                             if full_transcript:
@@ -766,6 +883,33 @@ def register_ivr_routes(app):
         disease_rows = conn.execute("SELECT COALESCE(main_problem,'Unknown') d, COUNT(*) c FROM ivr_reports GROUP BY LOWER(d) ORDER BY c DESC LIMIT 6").fetchall()
         # Daily
         daily = conn.execute("SELECT * FROM ivr_analytics_daily ORDER BY date DESC LIMIT 7").fetchall()
+        # Helpline channel + routing funnel (live counts)
+        try:
+            helpline_calls = conn.execute("SELECT COUNT(*) c FROM ivr_calls WHERE channel='HELPLINE'").fetchone()["c"]
+        except Exception:
+            helpline_calls = 0
+        try:
+            helpline_reports = conn.execute("SELECT COUNT(*) c FROM ivr_reports WHERE source='HELPLINE'").fetchone()["c"]
+        except Exception:
+            helpline_reports = 0
+        try:
+            by_channel = [{"label": r["ch"], "value": r["c"]} for r in
+                          conn.execute("SELECT COALESCE(channel,'IVR') ch, COUNT(*) c FROM ivr_calls GROUP BY ch").fetchall()]
+        except Exception:
+            by_channel = []
+        try:
+            identified = conn.execute("SELECT COUNT(*) c FROM ivr_sessions WHERE caller_user_id IS NOT NULL").fetchone()["c"]
+        except Exception:
+            identified = 0
+        try:
+            prefilled_calls = conn.execute("SELECT COUNT(DISTINCT call_sid) c FROM ivr_survey_responses WHERE transcript='prefilled:profile'").fetchone()["c"]
+        except Exception:
+            prefilled_calls = 0
+        try:
+            by_routing = [{"label": r["rs"], "value": r["c"]} for r in
+                          conn.execute("SELECT COALESCE(routing_status,'UNKNOWN') rs, COUNT(*) c FROM ivr_sessions GROUP BY rs").fetchall()]
+        except Exception:
+            by_routing = []
         # Merge with govt analytics for integrated view
         conn.close()
         return jsonify({
@@ -781,6 +925,12 @@ def register_ivr_routes(app):
             "by_district": [{"label": r["d"], "value": r["c"]} for r in district_rows],
             "by_problem": [{"label": r["d"], "value": r["c"]} for r in disease_rows],
             "daily": [dict(d) for d in daily],
+            "helpline_calls": helpline_calls,
+            "helpline_reports": helpline_reports,
+            "by_channel": by_channel,
+            "identified_farmers": identified,
+            "prefilled_calls": prefilled_calls,
+            "by_routing_status": by_routing,
         })
 
     @app.route("/api/ivr/location/share", methods=["POST", "GET"])
@@ -870,19 +1020,106 @@ def register_ivr_routes(app):
     @app.route("/api/ivr/health", methods=["GET"])
     def ivr_health():
         from .config import get_ivr_config_summary, validate_required_config, is_provider_configured
+        from .services import gateway as _gw
         missing = validate_required_config()
+        conn = get_db()
+        try:
+            gw = _gw.gateway_health(conn)
+            pstn = _gw.pstn_status(conn)
+        except Exception:
+            gw = {"pbx_healthy": False, "pbx_last_heartbeat_at_utc": None,
+                  "pbx_last_heartbeat_age_s": None, "pbx_host": None,
+                  "sip_registered": False, "sip_trunk": None}
+            pstn = {"pstn_connected": False, "first_real_inbound_at_utc": None,
+                    "first_real_inbound_sid": None}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        # Distinct liveness signals: the application/IVR being up says NOTHING
+        # about the voice path. pbx/sip/pstn are true only when verified:
+        # heartbeats for pbx/sip, an actual authenticated inbound call for pstn.
         return jsonify({
             "status": "ok" if not missing else "degraded",
+            "application": True,
+            "ivr": True,
+            "pbx": gw["pbx_healthy"],
+            "pbx_detail": gw,
+            "sip_registered": gw["sip_registered"],
+            "pstn_connected": pstn["pstn_connected"],
+            "pstn_detail": pstn,
             "config": get_ivr_config_summary(),
             "missing_env": missing,
             "provider_ready": is_provider_configured(),
             "version": "1.0-ivr",
         })
 
+    # -------------------- VOICE GATEWAY (self-hosted PBX) --------------------
+    # Secret-authenticated endpoints for the Asterisk gateway in pbx/ ONLY.
+    # Never uses the permissive mock signature path: gateway auth fails closed
+    # when PBX_WEBHOOK_SECRET is unset.
+    @app.route("/api/ivr/gateway/heartbeat", methods=["POST"])
+    def gateway_heartbeat():
+        from .services import gateway as _gw
+        ip = request.remote_addr or "unknown"
+        if is_rate_limited(ip, IVR_RATE_LIMIT_PER_MINUTE):
+            return jsonify({"error": "Rate limit exceeded"}), 429
+        if not _gw.gateway_ip_allowed(request):
+            return jsonify({"error": "Forbidden"}), 403
+        if not _gw.gateway_authenticated(request):
+            return jsonify({"error": "Invalid gateway credentials"}), 401
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            data = {}
+        conn = get_db()
+        try:
+            summary = _gw.record_heartbeat(conn, data)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({"ok": True, **summary})
+
+    @app.route("/api/ivr/gateway/authorize-dial", methods=["POST"])
+    def gateway_authorize_dial():
+        from .services import gateway as _gw
+        ip = request.remote_addr or "unknown"
+        if is_rate_limited(ip, IVR_RATE_LIMIT_PER_MINUTE):
+            return jsonify({"error": "Rate limit exceeded"}), 429
+        if not _gw.gateway_ip_allowed(request):
+            return jsonify({"error": "Forbidden"}), 403
+        if not _gw.gateway_authenticated(request):
+            return jsonify({"error": "Invalid gateway credentials"}), 401
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            data = {}
+        call_sid = data.get("call_sid") or ""
+        number = data.get("number") or ""
+        conn = get_db()
+        try:
+            decision = _gw.authorize_dial_number(conn, call_sid, number)
+            try:
+                conn.execute(
+                    "INSERT INTO ivr_events (call_sid, event_type, details, actor) VALUES (?,?,?,?)",
+                    (call_sid, "DIAL_AUTHORIZE",
+                     json.dumps({"number_last4": (number or "")[-4:], "allowed": decision.get("allowed")}), "pbx-gateway"))
+                conn.commit()
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify(decision), (200 if decision.get("allowed") else 403)
+
     # -------------------- MOCK / DEV helpers --------------------
     @app.route("/api/ivr/mock/call", methods=["POST"])
     def mock_initiate_call():
-        """Dev helper: simulate inbound call without real telephony."""
+        """Dev helper: simulate inbound call without real telephony.
+        Mirrors real inbound identification (farmer link + known language)."""
         data = request.get_json(force=True) or {}
         from_number = data.get("from") or data.get("caller") or data.get("phone") or "+919800000001"
         to_number = data.get("to") or os.environ.get("IVR_PHONE_NUMBER", "+911800123456")
@@ -890,10 +1127,23 @@ def register_ivr_routes(app):
         call_sid = f"MOCK-{uuid.uuid4().hex[:10].upper()}"
         conn = get_db()
         create_call_record(conn, provider_name, normalize_phone(from_number), to_number, call_sid=call_sid, is_mock=True)
+        known_lang = None
+        try:
+            farmer = identify_and_link_caller(conn, call_sid)
+            if farmer:
+                known_lang = apply_known_language(conn, call_sid, farmer)
+        except Exception:
+            pass
         conn.close()
         provider = get_telephony_provider()
-        twiml = provider.generate_welcome_twiml(call_sid, "en")
-        return jsonify({"call_sid": call_sid, "twiml": twiml, "from": from_number, "to": to_number})
+        if known_lang:
+            say_hi = provider._say(f"{t('welcome', known_lang)} {t('language_confirm', known_lang)}", known_lang)
+            say_menu = provider._say(t("main_menu", known_lang), known_lang)
+            gather = provider._gather(say_menu, action=f"/api/ivr/webhook/menu?call_sid={call_sid}", num_digits=1, timeout=10, input_type="dtmf speech")
+            twiml = provider._wrap_response(say_hi + gather + provider._redirect(f"/api/ivr/webhook/menu?call_sid={call_sid}"))
+        else:
+            twiml = provider.generate_welcome_twiml(call_sid, "en")
+        return jsonify({"call_sid": call_sid, "twiml": twiml, "from": from_number, "to": to_number, "language": known_lang or "en"})
 
     @app.route("/api/ivr/mock/dtmf", methods=["POST"])
     def mock_dtmf():

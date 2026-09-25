@@ -22,7 +22,12 @@ import json
 import uuid
 from datetime import datetime, date, timedelta
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "animal_health.db")
+try:
+    import fcntl  # Unix-only; Windows dev falls back to unlocked init
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+DB_PATH = os.environ.get("SIH_DB_PATH") or os.path.join(os.path.dirname(__file__), "animal_health.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -38,6 +43,8 @@ CREATE TABLE IF NOT EXISTS users (
     block TEXT,
     district TEXT,
     state TEXT DEFAULT 'Maharashtra',
+    preferred_language TEXT,
+    availability_status TEXT,
     is_seed INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -455,6 +462,10 @@ CREATE INDEX IF NOT EXISTS idx_weather_dist ON weather_observations(district, fe
 
 
 def get_db():
+    # Ensure the DB directory exists (production persistent disk may be an empty mount).
+    _db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if _db_dir and not os.path.isdir(_db_dir):
+        os.makedirs(_db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -519,11 +530,74 @@ def calculate_expected_delivery(species: str, breeding_date_str: str) -> str:
     return str(b_date + timedelta(days=days))
 
 
+def ensure_ivr_columns(conn):
+    """Additive IVR columns for existing databases (helpline channel, routing)."""
+    def _add(table, col, coltype):
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+    _add("ivr_calls", "channel", "TEXT DEFAULT 'IVR'")
+    _add("ivr_sessions", "region", "TEXT")
+    _add("ivr_sessions", "routing_status", "TEXT")
+    _add("ivr_sessions", "location_source", "TEXT")
+    _add("ivr_reports", "source", "TEXT DEFAULT 'IVR'")
+    conn.commit()
+
+
+def migrate_ivr_reports_location_source(conn):
+    """Rebuild ivr_reports once to allow PROFILE/DISTRICT_LEVEL/UNKNOWN location
+    sources (SQLite cannot ALTER a CHECK constraint). Data-preserving: copies
+    every existing column by name. No-op when already migrated."""
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='ivr_reports'").fetchone()
+    if not sql_row or not sql_row["sql"]:
+        return
+    if "'PROFILE'" in sql_row["sql"]:
+        return
+    import re
+    from ivr.schema import IVR_SCHEMA
+    m = re.search(r"CREATE TABLE IF NOT EXISTS ivr_reports \(.*?\);\n", IVR_SCHEMA, re.S)
+    if not m:
+        print("migrate_ivr_reports_location_source: DDL not found, skipping")
+        return
+    new_ddl = m.group(0).replace("ivr_reports (", "ivr_reports_new (", 1)
+    old_cols = [r["name"] for r in conn.execute("PRAGMA table_info(ivr_reports)").fetchall()]
+    collist = ", ".join(old_cols)
+    conn.executescript("PRAGMA foreign_keys=OFF;")
+    conn.executescript(new_ddl)
+    conn.execute(f"INSERT INTO ivr_reports_new ({collist}) SELECT {collist} FROM ivr_reports")
+    conn.execute("DROP TABLE ivr_reports")
+    conn.execute("ALTER TABLE ivr_reports_new RENAME TO ivr_reports")
+    conn.executescript(IVR_SCHEMA)  # recreate indexes dropped with the old table
+    conn.executescript("PRAGMA foreign_keys=ON;")
+    conn.commit()
+    print("migrate_ivr_reports_location_source: CHECK expanded (PROFILE/DISTRICT_LEVEL/UNKNOWN)")
+
+
+def ensure_seed_vet_availability(conn):
+    """Seed demo vets are explicitly AVAILABLE so automated tests and demos are
+    deterministic regardless of wall-clock working hours. Real vets default to
+    automatic (hours + call-state) availability."""
+    conn.execute(
+        "UPDATE users SET availability_status='AVAILABLE' "
+        "WHERE role='vet' AND is_seed=1 AND availability_status IS NULL")
+    conn.commit()
+
+
 def init_ivr_schema(conn):
     """Initialize IVR extension tables and default configs."""
     try:
         from ivr.schema import IVR_SCHEMA, DEFAULT_SURVEY_CONFIG_JSON
-        conn.executescript(IVR_SCHEMA)
+        try:
+            conn.executescript(IVR_SCHEMA)
+        except sqlite3.OperationalError:
+            # Old table versions may lack columns referenced by new indexes
+            # (e.g. ivr_reports.source). Add columns first, then re-run; every
+            # statement is IF NOT EXISTS so re-running is safe.
+            ensure_ivr_columns(conn)
+            conn.executescript(IVR_SCHEMA)
+        ensure_ivr_columns(conn)
+        migrate_ivr_reports_location_source(conn)
         # Insert default survey config if empty
         has_cfg = conn.execute("SELECT COUNT(*) c FROM ivr_survey_config WHERE config_key='survey_definition'").fetchone()["c"]
         if not has_cfg:
@@ -536,6 +610,26 @@ def init_ivr_schema(conn):
         print(f"init_ivr_schema warning: {e}")
 
 def init_db(reset=False):
+    """Create schema + seeds. Safe under multi-worker WSGI: an exclusive
+    cross-process file lock ensures only one worker initialises a fresh DB
+    at a time (prevents half-seeded reads and duplicate-seed races)."""
+    if fcntl is not None:
+        _db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+        if _db_dir and not os.path.isdir(_db_dir):
+            os.makedirs(_db_dir, exist_ok=True)
+        with open(DB_PATH + ".init.lock", "w") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            try:
+                return _init_db_inner(reset)
+            finally:
+                try:
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+    return _init_db_inner(reset)
+
+
+def _init_db_inner(reset=False):
     if reset and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     first_time = not os.path.exists(DB_PATH)
@@ -552,6 +646,7 @@ def init_db(reset=False):
     ensure_lab_user(conn)
     ensure_qr_for_existing_animals(conn)
     ensure_extended_seeds(conn)
+    ensure_seed_vet_availability(conn)
     conn.commit()
     # IVR schema (always ensure, even if not first_time, for upgrades)
     init_ivr_schema(conn)
@@ -736,6 +831,13 @@ def ensure_new_columns(conn):
     if "state" not in h_cols:
         conn.execute("ALTER TABLE herds ADD COLUMN state TEXT DEFAULT 'Maharashtra'")
 
+    # users columns (helpline: saved language + vet availability override)
+    u_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "preferred_language" not in u_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN preferred_language TEXT")
+    if "availability_status" not in u_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN availability_status TEXT")
+
     conn.commit()
 
 
@@ -871,18 +973,23 @@ def ensure_extended_seeds(conn):
                 (case1["id"], case1["animal_id"], vet_id)
             )
 
-    # Seed farm alert if none exists
+    # Seed farm alert if none exists (resolve herd FK by code; skip if herd
+    # seeding hasn't completed yet so a concurrent boot can never FK-fail).
     has_fa = conn.execute("SELECT COUNT(*) c FROM farm_alerts").fetchone()["c"]
     if not has_fa:
-        conn.execute(
-            """
-            INSERT INTO farm_alerts (herd_id, herd_code, district, disease, affected_animals_count, affected_animals_codes, risk_level, trigger_reason, recommended_action, supporting_evidence, status)
-            VALUES (1, 'HERD-MH-PUN-1001', 'Pune', 'HS (suspected)', 1, 'MH-PUN-000001', 'Moderate',
-                    'Active acute respiratory and fever case detected in Wagholi cluster',
-                    'Perform preventive herd ring vaccination and temperature screening',
-                    'Case CASE-000801 with medium severity symptoms reported', 'ACTIVE')
-            """
-        )
+        _herd = conn.execute(
+            "SELECT id FROM herds WHERE herd_code='HERD-MH-PUN-1001'").fetchone()
+        if _herd:
+            conn.execute(
+                """
+                INSERT INTO farm_alerts (herd_id, herd_code, district, disease, affected_animals_count, affected_animals_codes, risk_level, trigger_reason, recommended_action, supporting_evidence, status)
+                VALUES (?, 'HERD-MH-PUN-1001', 'Pune', 'HS (suspected)', 1, 'MH-PUN-000001', 'Moderate',
+                        'Active acute respiratory and fever case detected in Wagholi cluster',
+                        'Perform preventive herd ring vaccination and temperature screening',
+                        'Case CASE-000801 with medium severity symptoms reported', 'ACTIVE')
+                """,
+                (_herd["id"],),
+            )
 
     # Seed national alert if none exists
     has_na = conn.execute("SELECT COUNT(*) c FROM national_alerts").fetchone()["c"]

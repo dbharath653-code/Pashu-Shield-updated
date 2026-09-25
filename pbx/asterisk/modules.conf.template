@@ -1,0 +1,30 @@
+; Pashu-Shield voice gateway - minimal module set (TEMPLATE).
+[modules]
+autoload = yes
+; --- attack surface reduction: unload what a pure inbound gateway never uses
+noload = chan_sip.so          ; legacy SIP stack (deprecated, scanner magnet)
+noload = chan_skinny.so
+noload = chan_mgcp.so
+noload = chan_unistim.so
+noload = chan_h323.so
+noload = res_ari.so            ; we use AGI only; no ARI/AMI/HTTP surface
+noload = res_ari_applications.so
+noload = res_ari_asterisk.so
+noload = res_ari_bridges.so
+noload = res_ari_channels.so
+noload = res_ari_device_states.so
+noload = res_ari_endpoints.so
+noload = res_ari_events.so
+noload = res_ari_mailboxes.so
+noload = res_ari_playbacks.so
+noload = res_ari_recordings.so
+noload = res_ari_sounds.so
+noload = res_http_websocket.so
+noload = res_manager.so        ; AMI disabled (see manager.conf)
+noload = res_config_ldap.so
+noload = res_config_sqlite3.so
+noload = app_voicemail.so
+noload = app_confbridge.so
+noload = app_queue.so
+noload = app_fax.so
+noload = res_fax.so

@@ -1,0 +1,15 @@
+# Pashu-Shield voice gateway - fail2ban jail (installed to
+# /etc/fail2ban/jail.d/asterisk-pashu.local by install.sh).
+# Bans SIP scanners / brute-force REGISTER attempts hitting Asterisk.
+[asterisk-pashu]
+enabled = true
+filter = asterisk-pashu
+logpath = /var/log/asterisk/security.log
+          /var/log/asterisk/messages
+maxretry = 3
+findtime = 600
+bantime = 86400
+# Never ban the carrier SBCs (space-separated - MUST match CARRIER_SIP_IPS).
+# install.sh does not auto-fill this: add your carrier IPs here after install.
+#ignoreip = 127.0.0.1/8 203.0.113.10
+banaction = ufw

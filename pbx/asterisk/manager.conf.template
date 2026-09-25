@@ -1,0 +1,5 @@
+; Pashu-Shield voice gateway - AMI stays OFF (no manager surface at all).
+[general]
+enabled = no
+port = 5038
+bindaddr = 127.0.0.1

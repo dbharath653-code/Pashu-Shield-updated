@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import pandas as pd
@@ -12,22 +13,30 @@ from sklearn.cluster import DBSCAN
 
 app = FastAPI(title="Livestock Health Surveillance AI & Decision Support API")
 
+# Production: restrict browser origins via CORS_ORIGINS env (comma-separated).
+# Default "*" preserves existing behaviour; credentialed requests require explicit origins.
+_CORS_ENV = os.environ.get("CORS_ORIGINS", "*").strip()
+_CORS_ORIGINS = [o.strip() for o in _CORS_ENV.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=("*" not in _CORS_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+
 # Load existing models safely
 def load_models():
     try:
-        rf_model = joblib.load("models/rf_model.pkl")
-        scaler = joblib.load("models/scaler.pkl")
-        iso_model = joblib.load("models/iso_model.pkl")
-        with open("models/metrics.json", "r") as f:
+        rf_model = joblib.load(os.path.join(MODELS_DIR, "rf_model.pkl"))
+        scaler = joblib.load(os.path.join(MODELS_DIR, "scaler.pkl"))
+        iso_model = joblib.load(os.path.join(MODELS_DIR, "iso_model.pkl"))
+        with open(os.path.join(MODELS_DIR, "metrics.json"), "r") as f:
             metrics = json.load(f)
+        print(f"ML models loaded from {MODELS_DIR}")
         return rf_model, scaler, iso_model, metrics
     except Exception as e:
         print(f"Error loading models: {e}")
@@ -56,6 +65,58 @@ class PredictRequest(BaseModel):
     animal_density: float
     previous_cases: float
     cases_growth_rate: float
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Landing page so the service root shows a real status dashboard
+    instead of a blank 404 (used by deploy previews and uptime checks)."""
+    loaded = rf_model is not None and scaler is not None and iso_model is not None
+    status = "ok" if loaded else "degraded"
+    dot = "#16a34a" if loaded else "#dc2626"
+    last_trained = (metrics or {}).get("last_trained", "unknown")
+    accuracy = (metrics or {}).get("accuracy", "unknown")
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Pashu-Shield ML API</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}}
+.card{{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:32px 36px;max-width:560px;width:92%;box-shadow:0 20px 60px rgba(0,0,0,.45)}}
+h1{{margin:0 0 4px;font-size:22px}}.sub{{color:#94a3b8;margin:0 0 20px;font-size:14px}}
+.badge{{display:inline-flex;align-items:center;gap:8px;background:#0b1220;border:1px solid #334155;border-radius:999px;padding:6px 14px;font-weight:600;font-size:14px}}
+.dot{{width:10px;height:10px;border-radius:50%;background:{dot};box-shadow:0 0 10px {dot}}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:20px 0}}
+.cell{{background:#0b1220;border:1px solid #334155;border-radius:10px;padding:10px 14px;font-size:13px}}
+.cell b{{display:block;color:#94a3b8;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}}
+.links{{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}}
+a{{color:#38bdf8;text-decoration:none;background:#0b1220;border:1px solid #334155;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600}}
+a:hover{{border-color:#38bdf8}}
+</style></head><body><div class="card">
+<h1>Pashu-Shield ML API</h1>
+<p class="sub">Livestock Health Surveillance AI &amp; Decision Support</p>
+<div class="badge"><span class="dot"></span>status: {status} &nbsp;·&nbsp; models_loaded: {str(loaded).lower()}</div>
+<div class="grid">
+<div class="cell"><b>Model version</b>v1.0</div>
+<div class="cell"><b>Last trained</b>{last_trained}</div>
+<div class="cell"><b>Accuracy</b>{accuracy}</div>
+<div class="cell"><b>Endpoints</b>/api/predict · /api/outbreak-detection · /api/forecast · /api/cluster</div>
+</div>
+<div class="links"><a href="/health">/health</a><a href="/api/model-performance">/api/model-performance</a><a href="/docs">Swagger UI (/docs)</a></div>
+</div></body></html>""")
+
+@app.get("/health")
+async def health():
+    loaded = rf_model is not None and scaler is not None and iso_model is not None
+    return {
+        "status": "ok" if loaded else "degraded",
+        "models_loaded": loaded,
+        "model_version": "v1.0",
+        "last_trained": (metrics or {}).get("last_trained"),
+    }
+
+@app.get("/api/health")
+async def api_health():
+    return await health()
 
 @app.post("/api/predict")
 async def predict_risk(req: PredictRequest):

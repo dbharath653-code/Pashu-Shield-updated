@@ -5,15 +5,30 @@ No hardcoded phone numbers, credentials, or secrets.
 import os
 
 # Core IVR phone number (PSTN) - must be configured via env
-IVR_PHONE_NUMBER = os.environ.get("IVR_PHONE_NUMBER", "")
+# Official Pashu-Shield helpline. Project default is the fixed production
+# number; override with IVR_PHONE_NUMBER only if the helpline ever changes.
+IVR_PHONE_NUMBER = os.environ.get("IVR_PHONE_NUMBER", "7382210251")
 
 # Telephony provider credentials (configurable)
-TELEPHONY_PROVIDER = os.environ.get("TELEPHONY_PROVIDER", "mock")  # mock | twilio | exotel | plivo
+# mock | twilio | exotel | plivo | sip
+# "sip" = self-hosted Asterisk PBX voice gateway (pbx/) fed by a carrier SIP
+# trunk. No Twilio/Exotel SDKs or credentials are used in this mode.
+TELEPHONY_PROVIDER = os.environ.get("TELEPHONY_PROVIDER", "mock")
 TELEPHONY_ACCOUNT_ID = os.environ.get("TELEPHONY_ACCOUNT_ID", "")
 TELEPHONY_AUTH_TOKEN = os.environ.get("TELEPHONY_AUTH_TOKEN", "")
 TELEPHONY_PHONE_NUMBER = os.environ.get("TELEPHONY_PHONE_NUMBER", IVR_PHONE_NUMBER)
 TELEPHONY_WEBHOOK_SECRET = os.environ.get("TELEPHONY_WEBHOOK_SECRET", "")
 TELEPHONY_API_URL = os.environ.get("TELEPHONY_API_URL", "")
+
+# ---- Self-hosted voice gateway (Asterisk PBX, TELEPHONY_PROVIDER=sip) ----
+# Shared secret the PBX gateway must present (X-PBX-Secret) on gateway
+# endpoints and on real-inbound webhook calls. REQUIRED in sip mode.
+# Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+PBX_WEBHOOK_SECRET = os.environ.get("PBX_WEBHOOK_SECRET", "")
+# Optional comma-separated IP allowlist for /api/ivr/gateway/* (PBX egress IPs).
+PBX_ALLOWED_IPS = [ip.strip() for ip in os.environ.get("PBX_ALLOWED_IPS", "").split(",") if ip.strip()]
+# Heartbeat freshness window: PBX is "healthy" if it pinged within this.
+PBX_HEARTBEAT_STALE_SECONDS = int(os.environ.get("PBX_HEARTBEAT_STALE_SECONDS", "300"))
 
 # Call recording
 IVR_RECORDING_ENABLED = os.environ.get("IVR_RECORDING_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -44,10 +59,81 @@ IVR_DUPLICATE_WINDOW_HOURS = int(os.environ.get("IVR_DUPLICATE_WINDOW_HOURS", "2
 # Async processing
 IVR_ASYNC_ENABLED = os.environ.get("IVR_ASYNC_ENABLED", "true").lower() in ("1", "true", "yes")
 
+# Veterinarian working hours (IST, 24h) used for automatic availability.
+# Vets with an explicit availability_status override these hours.
+VET_WORK_START_HOUR = int(os.environ.get("VET_WORK_START_HOUR", "8"))
+VET_WORK_END_HOUR = int(os.environ.get("VET_WORK_END_HOUR", "20"))
+VET_TIMEZONE = os.environ.get("VET_TIMEZONE", "Asia/Kolkata")
+VET_MAX_ACTIVE_CASES = int(os.environ.get("VET_MAX_ACTIVE_CASES", "10"))
+
+# Preferred-language choices for farmers/vets (also the IVR menu order).
+# Add new Indian languages here + a locales/<code>.json file + LANGUAGE_DTMF entry.
+LANGUAGE_NAMES = {"en": "English", "te": "Telugu", "hi": "Hindi", "mr": "Marathi"}
+
+
+def _helpline_digits():
+    import re
+    return re.sub(r"\D", "", IVR_PHONE_NUMBER or "")
+
+
+def get_helpline_e164():
+    """Helpline in E.164 for tel: links, e.g. +917382210251."""
+    d = _helpline_digits()
+    if len(d) == 10:
+        return f"+91{d}"
+    if d.startswith("91") and len(d) == 12:
+        return f"+{d}"
+    return f"+{d}" if d else ""
+
+
+def get_helpline_display_in():
+    """Helpline in Indian display format, e.g. +91 73822 10251."""
+    d = _helpline_digits()
+    local = d[-10:] if len(d) >= 10 else d
+    if len(local) == 10:
+        return f"+91 {local[:5]} {local[5:]}"
+    return IVR_PHONE_NUMBER or ""
+
+
+def is_helpline_number(to_number):
+    """True when the dialled number is the Pashu-Shield helpline (last-10 match)."""
+    import re
+    want = _helpline_digits()[-10:]
+    got = re.sub(r"\D", "", to_number or "")[-10:]
+    return bool(want) and bool(got) and want == got
+
+def get_pstn_status():
+    """Honest, DB-backed PSTN status. True ONLY after an authenticated voice
+    gateway has delivered at least one real (non-mock) inbound call. No config
+    flag or public API can set this; see services/gateway.record_real_inbound.
+    Returns (pstn_connected: bool, first_real_inbound_at: str|None)."""
+    try:
+        import database
+        conn = database.get_db()
+        row = conn.execute(
+            "SELECT value, updated_at FROM ivr_gateway_state WHERE key='first_real_inbound_at'").fetchone()
+        conn.close()
+        if row and row["value"]:
+            return True, row["updated_at"]
+    except Exception:
+        pass
+    return False, None
+
+
 def get_ivr_config_summary():
     """Return sanitized config for admin view (no secrets)."""
+    pstn_connected, first_inbound = get_pstn_status()
     return {
         "ivr_phone_number": IVR_PHONE_NUMBER or "NOT_CONFIGURED",
+        "helpline_number": _helpline_digits() or "NOT_CONFIGURED",
+        "helpline_e164": get_helpline_e164() or "NOT_CONFIGURED",
+        "helpline_display_in": get_helpline_display_in() or "NOT_CONFIGURED",
+        # Honest PSTN flag: DB-backed, set only by a real authenticated inbound
+        # call through the voice gateway. Until a carrier/SIP-trunk delivers
+        # such a call, this stays False and is reported as such.
+        "pstn_connected": pstn_connected,
+        "first_real_inbound_at": first_inbound,
+        "pstn_note": "PSTN termination for the helpline requires a carrier/SIP-trunk provider. The website opens the farmer's native dialer (tel: link); the browser cannot receive PSTN calls directly.",
         "telephony_provider": TELEPHONY_PROVIDER,
         "telephony_phone_number": TELEPHONY_PHONE_NUMBER or "NOT_CONFIGURED",
         "recording_enabled": IVR_RECORDING_ENABLED,
@@ -64,6 +150,10 @@ def is_provider_configured():
     """Check if real telephony provider is configured."""
     if TELEPHONY_PROVIDER == "mock":
         return True  # mock always works for dev
+    if TELEPHONY_PROVIDER == "sip":
+        # Self-hosted PBX: only the shared gateway secret is required.
+        # No carrier/SaaS credentials live in this repo.
+        return bool(PBX_WEBHOOK_SECRET)
     return bool(TELEPHONY_ACCOUNT_ID and TELEPHONY_AUTH_TOKEN and TELEPHONY_PHONE_NUMBER)
 
 def validate_required_config():
@@ -71,7 +161,11 @@ def validate_required_config():
     missing = []
     if not IVR_PHONE_NUMBER:
         missing.append("IVR_PHONE_NUMBER")
-    if TELEPHONY_PROVIDER != "mock":
+    if TELEPHONY_PROVIDER == "sip":
+        # Self-hosted PBX mode: only the gateway shared secret is required.
+        if not PBX_WEBHOOK_SECRET:
+            missing.append("PBX_WEBHOOK_SECRET")
+    elif TELEPHONY_PROVIDER != "mock":
         if not TELEPHONY_ACCOUNT_ID:
             missing.append("TELEPHONY_ACCOUNT_ID")
         if not TELEPHONY_AUTH_TOKEN:

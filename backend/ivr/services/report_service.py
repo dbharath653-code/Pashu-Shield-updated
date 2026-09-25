@@ -16,6 +16,17 @@ def generate_report_no(conn) -> str:
     from database import next_code
     return next_code(conn, "IVR", "ivr_reports", "report_no", pad=6, district="PUN")
 
+def get_call_channel(conn, call_sid: str) -> str:
+    """HELPLINE when the call arrived on the helpline number, else IVR."""
+    try:
+        row = conn.execute("SELECT channel FROM ivr_calls WHERE call_sid=?", (call_sid,)).fetchone()
+        if row and row["channel"] in ("IVR", "HELPLINE"):
+            return row["channel"]
+    except Exception:
+        pass
+    return "IVR"
+
+
 def create_ivr_report_from_survey(conn, call_sid: str, responses: Dict[str, Any],
                                   language: str = "en", transcript: str = "",
                                   caller_phone: str = "", duration_seconds: int = 0,
@@ -27,8 +38,18 @@ def create_ivr_report_from_survey(conn, call_sid: str, responses: Dict[str, Any]
         else:
             normalized[k] = v
 
+    channel = get_call_channel(conn, call_sid)
     caller_norm = normalize_phone(caller_phone or normalized.get("caller_number") or normalized.get("farmer_phone") or "")
     loc = get_location_from_responses(normalized)
+    # Honest provenance: PROFILE only when village+district in effect both came
+    # from the verified farmer profile without farmer override.
+    try:
+        from .farmer import location_provenance
+        if location_provenance(conn, call_sid) == "PROFILE":
+            loc["location_source"] = "PROFILE"
+            loc["location_accuracy"] = "Verified farmer profile (registration record)"
+    except Exception:
+        pass
     is_dup, dup_id = check_duplicate(conn, caller_norm, normalized.get("species"), normalized.get("main_problem"), hours=24)
     status = "PARTIALLY_COMPLETED" if is_partial else "RECEIVED"
     if is_dup:
@@ -43,12 +64,20 @@ def create_ivr_report_from_survey(conn, call_sid: str, responses: Dict[str, Any]
     urgency = structured.get("urgency", "MEDIUM")
     report_no = generate_report_no(conn)
 
-    # Insert ivr_reports - 39 columns
-    placeholders_39 = ",".join(["?"]*39)
+    # Caller link for farmer-owned report visibility + region history.
+    caller_user_id = None
+    try:
+        sess = conn.execute("SELECT caller_user_id FROM ivr_sessions WHERE call_sid=?", (call_sid,)).fetchone()
+        caller_user_id = sess["caller_user_id"] if sess else None
+    except Exception:
+        pass
+
+    # Insert ivr_reports - 41 columns
+    placeholders_41 = ",".join(["?"]*41)
     cur = conn.execute(
         f"""
         INSERT INTO ivr_reports
-        (report_no, call_sid, caller_number, language, status, urgency,
+        (report_no, call_sid, caller_number, caller_user_id, language, status, urgency, source,
          animal_species, animal_breed, animal_age, animal_sex, animal_count, is_pregnant,
          symptoms, duration, severity, eating_status, drinking_status, temperature,
          vaccination_status, previous_disease, medicines_given, main_problem, additional_description,
@@ -57,9 +86,9 @@ def create_ivr_report_from_survey(conn, call_sid: str, responses: Dict[str, Any]
          farmer_name, is_duplicate, duplicate_of_report_id,
          ai_summary, ai_structured_json, ai_confidence,
          transcript_full, call_duration_seconds)
-        VALUES ({placeholders_39})
+        VALUES ({placeholders_41})
         """,
-        (report_no, call_sid, caller_norm, language, status, urgency,
+        (report_no, call_sid, caller_norm, caller_user_id, language, status, urgency, channel,
          normalized.get("species") or "Not provided",
          normalized.get("breed") or "Not provided",
          normalized.get("age") or "Not provided",
@@ -95,14 +124,21 @@ def create_ivr_report_from_survey(conn, call_sid: str, responses: Dict[str, Any]
          duration_seconds)
     )
     report_id = cur.lastrowid
-    case_id = _create_linked_case(conn, normalized, loc, caller_norm, structured, report_no, call_sid, transcript_full, urgency, language)
+    case_id = _create_linked_case(conn, normalized, loc, caller_norm, structured, report_no, call_sid, transcript_full, urgency, language, channel)
     conn.execute("UPDATE ivr_reports SET case_id=? WHERE id=?", (case_id, report_id))
     try:
         from database import audit_log
-        audit_log(conn, "CREATE_IVR_REPORT", "ivr_report", report_id, details={"report_no": report_no, "call_sid": call_sid, "urgency": urgency, "is_duplicate": is_dup})
+        audit_log(conn, "CREATE_IVR_REPORT", "ivr_report", report_id, details={"report_no": report_no, "call_sid": call_sid, "urgency": urgency, "is_duplicate": is_dup, "source": channel})
     except Exception:
         pass
-    _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, caller_norm, case_id)
+    _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, caller_norm, case_id, channel)
+    try:
+        from .call_service import set_routing_status
+        set_routing_status(conn, call_sid, "REPORT_CREATED", {"report_id": report_id, "report_no": report_no, "source": channel})
+        conn.execute("UPDATE ivr_sessions SET location_source=? WHERE call_sid=?", (loc.get("location_source"), call_sid))
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
     try:
         conn.execute(
@@ -118,7 +154,8 @@ def create_ivr_report_from_survey(conn, call_sid: str, responses: Dict[str, Any]
     case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone() if case_id else None
     return {"report": dict(report) if report else {}, "case_id": case_id, "report_no": report_no, "urgency": urgency, "is_duplicate": is_dup}
 
-def _create_linked_case(conn, normalized, loc, caller_norm, structured, report_no, call_sid, transcript_full, urgency, language):
+def _create_linked_case(conn, normalized, loc, caller_norm, structured, report_no, call_sid, transcript_full, urgency, language, channel="IVR"):
+    channel = channel if channel in ("IVR", "HELPLINE") else "IVR"
     try:
         from database import next_code, audit_log
         owner = None
@@ -180,7 +217,7 @@ def _create_linked_case(conn, normalized, loc, caller_norm, structured, report_n
         severity = sev_map.get(raw_sev, "Medium")
 
         desc_parts = [
-            f"IVR Automated Survey Report {report_no} (Call {call_sid}, Language: {language})",
+            f"{channel} Automated Survey Report {report_no} (Call {call_sid}, Language: {language})",
             f"Farmer: {normalized.get('farmer_name') or 'Not provided'} | Phone: {caller_norm or 'Not provided'}",
             f"Location: {loc.get('village')}, {loc.get('district')}, {loc.get('state')} (Source: {loc.get('location_source')})",
             f"Animal: {species} x{normalized.get('animal_count') or 1}, Breed: {normalized.get('breed') or 'Not provided'}, Age: {normalized.get('age') or 'Not provided'}, Sex: {normalized.get('sex') or 'Not provided'}",
@@ -209,14 +246,14 @@ def _create_linked_case(conn, normalized, loc, caller_norm, structured, report_n
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (case_no, animal["id"], animal["herd_id"], owner["id"], None,
              ", ".join(structured.get("symptoms", [])) if structured.get("symptoms") else (normalized.get("symptoms") or normalized.get("main_problem") or "Not provided"),
-             disease_suspected, severity, description, "IVR", "NEW")
+             disease_suspected, severity, description, channel, "NEW")
         )
         case_id = cur.lastrowid
         conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
-                     (case_id, "NEW", f"Reported via IVR automated survey (Report {report_no}, Urgency {urgency})", "IVR System"))
+                     (case_id, "NEW", f"Reported via {channel} automated survey (Report {report_no}, Urgency {urgency})", f"{channel} System"))
         if urgency in ("HIGH", "CRITICAL"):
             conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
-                         (case_id, "NEW", f"⚠️ IVR auto-escalated as {urgency} priority — immediate vet attention recommended", "IVR System"))
+                         (case_id, "NEW", f"⚠️ {channel} auto-escalated as {urgency} priority — immediate vet attention recommended", f"{channel} System"))
         return case_id
     except Exception as e:
         print(f"_create_linked_case failed: {e}")
@@ -224,7 +261,8 @@ def _create_linked_case(conn, normalized, loc, caller_norm, structured, report_n
         traceback.print_exc()
         return None
 
-def _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, caller_norm, case_id):
+def _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, caller_norm, case_id, channel="IVR"):
+    channel = channel if channel in ("IVR", "HELPLINE") else "IVR"
     try:
         district = loc.get("district") or normalized.get("location_district") or ""
         if district and district != "Not provided":
@@ -235,8 +273,15 @@ def _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, c
             vets = conn.execute("SELECT id FROM users WHERE role='vet' LIMIT 3").fetchall()
         species = normalized.get("species") or "Animal"
         main_problem = normalized.get("main_problem") or "Health issue"
+        lang_note = ""
+        try:
+            sess_lang = conn.execute("SELECT language FROM ivr_sessions WHERE call_sid=(SELECT call_sid FROM ivr_reports WHERE id=?)", (report_id,)).fetchone()
+            if sess_lang and sess_lang["language"]:
+                lang_note = f" | Lang: {sess_lang['language']}"
+        except Exception:
+            pass
         for v in vets:
-            msg = f"📞 New IVR report {report_no}: {species} - {main_problem} | Urgency: {urgency} | District: {district or 'Unknown'} | Caller: {caller_norm[-4:] if caller_norm else 'Unknown'}"
+            msg = f"📞 New {channel} report {report_no}: {species} - {main_problem} | Urgency: {urgency} | District: {district or 'Unknown'}{lang_note} | Caller: ****{caller_norm[-4:] if caller_norm else 'Unknown'}"
             if case_id:
                 row = conn.execute('SELECT case_no FROM cases WHERE id=?', (case_id,)).fetchone()
                 if row:
@@ -244,12 +289,12 @@ def _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, c
             conn.execute("INSERT INTO notifications (user_id, message, type) VALUES (?,?,?)", (v["id"], msg, "case"))
         govts = conn.execute("SELECT id FROM users WHERE role='govt' LIMIT 5").fetchall()
         for g in govts:
-            msg = f"📊 IVR report {report_no} received: {species} in {district or 'Unknown'} | Urgency: {urgency} | Total affected: {normalized.get('animal_count') or 1}"
+            msg = f"📊 {channel} report {report_no} received: {species} in {district or 'Unknown'} | Urgency: {urgency}{lang_note} | Total affected: {normalized.get('animal_count') or 1}"
             conn.execute("INSERT INTO notifications (user_id, message, type) VALUES (?,?,?)", (g["id"], msg, "case"))
         if caller_norm:
             owner = conn.execute("SELECT id FROM users WHERE mobile=?", (caller_norm,)).fetchone()
             if owner:
-                msg = f"✅ Your IVR report {report_no} has been received and sent to veterinary team. Urgency: {urgency}. You will be contacted if follow-up is needed."
+                msg = f"✅ Your {channel} report {report_no} has been received and sent to veterinary team. Urgency: {urgency}. You will be contacted if follow-up is needed."
                 conn.execute("INSERT INTO notifications (user_id, message, type) VALUES (?,?,?)", (owner["id"], msg, "case"))
     except Exception as e:
         print(f"_notify failed: {e}")
@@ -265,6 +310,13 @@ def create_ivr_report_from_vet_transcript(conn, call_sid: str, transcript: str, 
         raise ValueError(msg)
     structured_json = json.dumps(structured, ensure_ascii=False)
     urgency = structured.get("urgency", "MEDIUM")
+    channel = get_call_channel(conn, call_sid)
+    caller_user_id = None
+    try:
+        sess = conn.execute("SELECT caller_user_id FROM ivr_sessions WHERE call_sid=?", (call_sid,)).fetchone()
+        caller_user_id = sess["caller_user_id"] if sess else None
+    except Exception:
+        pass
     # Try to infer location from caller profile
     loc = {"village": "Not provided", "district": "Not provided", "state": "Maharashtra", "location_source": "NOT_AVAILABLE", "location_accuracy": "No location", "lat": None, "lng": None, "block": ""}
     if caller_phone:
@@ -276,11 +328,11 @@ def create_ivr_report_from_vet_transcript(conn, call_sid: str, transcript: str, 
             loc["location_source"] = "FARMER_PROVIDED"
             loc["location_accuracy"] = "From caller profile"
     report_no = generate_report_no(conn)
-    placeholders_39 = ",".join(["?"]*39)
+    placeholders_41 = ",".join(["?"]*41)
     cur = conn.execute(
         f"""
         INSERT INTO ivr_reports
-        (report_no, call_sid, caller_number, language, status, urgency,
+        (report_no, call_sid, caller_number, caller_user_id, language, status, urgency, source,
          animal_species, animal_breed, animal_age, animal_sex, animal_count, is_pregnant,
          symptoms, duration, severity, eating_status, drinking_status, temperature,
          vaccination_status, previous_disease, medicines_given, main_problem, additional_description,
@@ -289,9 +341,9 @@ def create_ivr_report_from_vet_transcript(conn, call_sid: str, transcript: str, 
          farmer_name, is_duplicate, duplicate_of_report_id,
          ai_summary, ai_structured_json, ai_confidence,
          transcript_full, call_duration_seconds)
-        VALUES ({placeholders_39})
+        VALUES ({placeholders_41})
         """,
-        (report_no, call_sid, caller_phone, language, "RECEIVED", urgency,
+        (report_no, call_sid, caller_phone, caller_user_id, language, "RECEIVED", urgency, channel,
          structured["animal"]["species"], structured["animal"]["breed"], structured["animal"]["age"], structured["animal"]["sex"],
          1, "Not provided",
          ", ".join(structured.get("symptoms", [])) if structured.get("symptoms") else "Not provided",
@@ -318,7 +370,7 @@ def create_ivr_report_from_vet_transcript(conn, call_sid: str, transcript: str, 
     # Link to case as well
     # Build normalized dict for case creation
     normalized = {"species": structured["animal"]["species"], "main_problem": structured.get("main_problem") or "Vet Consultation"}
-    case_id = _create_linked_case(conn, normalized, loc, caller_phone, structured, report_no, call_sid, transcript, urgency, language)
+    case_id = _create_linked_case(conn, normalized, loc, caller_phone, structured, report_no, call_sid, transcript, urgency, language, channel)
     conn.execute("UPDATE ivr_reports SET case_id=? WHERE id=?", (case_id, report_id))
     try:
         from database import audit_log
@@ -326,7 +378,7 @@ def create_ivr_report_from_vet_transcript(conn, call_sid: str, transcript: str, 
     except Exception:
         pass
     # Notify govt/vet
-    _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, caller_phone, case_id)
+    _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, caller_phone, case_id, channel)
     conn.commit()
     return {"report_id": report_id, "report_no": report_no}
 

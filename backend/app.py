@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import re
 import uuid
 import jwt
 import sqlite3
@@ -40,6 +41,21 @@ FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
 PORT = int(os.environ.get("PORT", "5001"))
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
+
+# Production hardening: initialise the database at import time so WSGI servers
+# (gunicorn) that never execute the `__main__` block still get schema + seeds.
+# init_db() is idempotent (CREATE TABLE IF NOT EXISTS); retry once to survive
+# multi-worker cold-start races on a fresh persistent disk.
+try:
+    init_db()
+    import database as _dbmod
+    print(f"Database ready at {_dbmod.DB_PATH}")
+except Exception as _init_err:
+    import time as _time
+    print(f"init_db first attempt failed ({_init_err}); retrying once...")
+    _time.sleep(2)
+    init_db()
+    print("Database ready after retry.")
 
 CASE_STATUSES = [
     "NEW", "ASSIGNED", "UNDER INVESTIGATION", "SAMPLE COLLECTED", "LAB PENDING",
@@ -85,9 +101,17 @@ def auth_required(roles=None):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer "):
+            token = auth.split(" ", 1)[1] if auth.startswith("Bearer ") else ""
+            if not token:
+                # Fallback for intermediaries that strip the Authorization
+                # header (observed: login 200 then dashboard 401 "Missing or
+                # invalid Authorization header" via proxied preview). The
+                # frontend only sends ?access_token= after a header-based 401,
+                # and the header form is always preferred when present.
+                token = request.args.get("access_token", "")
+            if not token:
                 return jsonify({"error": "Missing or invalid Authorization header"}), 401
-            payload = decode_token(auth.split(" ", 1)[1])
+            payload = decode_token(token)
             if not payload:
                 return jsonify({"error": "Invalid or expired token"}), 401
             if roles and payload["role"] not in roles:
@@ -180,6 +204,19 @@ def check_allergy_conflict(medicine_name: str, active_allergies: list) -> dict |
 def no_cache_static(resp):
     if request.path in ("/", "/index.html") or request.path.endswith((".js", ".css")):
         resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    # Optional CORS for split deployments (frontend hosted separately).
+    # Same-origin (default: Flask serves frontend) needs nothing. Set
+    # CORS_ORIGINS="https://app.example.com,https://other.example.com" to enable.
+    _cors = os.environ.get("CORS_ORIGINS", "").strip()
+    if _cors:
+        _allowed = [o.strip() for o in _cors.split(",") if o.strip()]
+        _origin = request.headers.get("Origin", "")
+        if _origin in _allowed:
+            resp.headers["Access-Control-Allow-Origin"] = _origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     return resp
 
 
@@ -202,22 +239,33 @@ def register():
         return jsonify({"error": "Password must be at least 6 characters"}), 400
     if data["role"] not in ("owner", "vet", "govt", "lab"):
         return jsonify({"error": "Invalid role"}), 400
+    preferred_language = (data.get("preferred_language") or "").strip().lower() or None
+    if preferred_language and preferred_language not in ("en", "te", "hi", "mr"):
+        return jsonify({"error": "Invalid preferred_language (use en, te, hi, mr)"}), 400
+    # Normalise identity fields so later logins match what the user typed here.
+    email_norm = str(data["email"]).strip().lower()
+    mobile_norm = re.sub(r"[\s\-]", "", str(data["mobile"]).strip())
+    name_norm = str(data["full_name"]).strip()
 
     conn = get_db()
     try:
         existing = conn.execute(
-            "SELECT id FROM users WHERE email=? OR mobile=?", (data["email"], data["mobile"])
+            "SELECT id FROM users WHERE LOWER(email)=LOWER(?) OR REPLACE(REPLACE(mobile,' ',''),'-','')=?",
+            (email_norm, mobile_norm),
         ).fetchone()
         if existing:
             return jsonify({"error": "An account with this email or mobile already exists"}), 409
 
         pw_hash, salt = hash_password(data["password"])
         cur = conn.execute(
-            "INSERT INTO users (full_name, mobile, email, password_hash, salt, role, specialization, village, block, district, state) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (data["full_name"], data["mobile"], data["email"], pw_hash, salt, data["role"],
-             data.get("specialization"), data.get("village"), data.get("block"),
-             data.get("district"), data.get("state", "Maharashtra")),
+            "INSERT INTO users (full_name, mobile, email, password_hash, salt, role, specialization, village, block, district, state, preferred_language) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (name_norm, mobile_norm, email_norm, pw_hash, salt, data["role"],
+             (data.get("specialization") or None) and str(data.get("specialization")).strip(),
+             (data.get("village") or None) and str(data.get("village")).strip(),
+             (data.get("block") or None) and str(data.get("block")).strip(),
+             str(data.get("district") or "").strip(),
+             str(data.get("state") or "Maharashtra").strip(), preferred_language),
         )
         user_id = cur.lastrowid
         audit_log(conn, "REGISTER_USER", "user", user_id, actor_id=user_id,
@@ -236,14 +284,18 @@ def register():
 @app.post("/api/auth/login")
 def login():
     data = request.get_json(force=True) or {}
-    identifier = data.get("identifier") or data.get("email") or data.get("mobile")
+    # Tolerant identifier: phone keyboards add trailing spaces / autocapitalise.
+    # Email matches case-insensitively; mobile matches ignoring spaces/dashes.
+    identifier = str(data.get("identifier") or data.get("email") or data.get("mobile") or "").strip()
     password = data.get("password")
     if not identifier or not password:
         return jsonify({"error": "Email/mobile and password are required"}), 400
+    mobile_norm = re.sub(r"[\s\-]", "", identifier)
 
     conn = get_db()
     user = conn.execute(
-        "SELECT * FROM users WHERE email=? OR mobile=?", (identifier, identifier)
+        "SELECT * FROM users WHERE LOWER(email)=LOWER(?) OR REPLACE(REPLACE(mobile,' ',''),'-','')=?",
+        (identifier, mobile_norm),
     ).fetchone()
     if not user or not verify_password(password, user["salt"], user["password_hash"]):
         conn.close()
@@ -262,6 +314,41 @@ def login():
 @auth_required()
 def me():
     conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (g.user["uid"],)).fetchone()
+    conn.close()
+    return jsonify(public_user(user))
+
+
+@app.put("/api/users/me")
+@auth_required()
+def update_me():
+    """Self-service profile update (strict whitelist): preferred language for
+    all roles; helpline availability override for vets only."""
+    data = request.get_json(force=True) or {}
+    updates, params = [], []
+    if "preferred_language" in data:
+        lang = (data.get("preferred_language") or "").strip().lower() or None
+        if lang and lang not in ("en", "te", "hi", "mr"):
+            return jsonify({"error": "Invalid preferred_language (use en, te, hi, mr)"}), 400
+        updates.append("preferred_language=?")
+        params.append(lang)
+    if "availability_status" in data:
+        if g.user["role"] != "vet":
+            return jsonify({"error": "Only veterinarians can set availability_status"}), 403
+        status = (data.get("availability_status") or "").strip().upper() or None
+        if status and status not in ("AVAILABLE", "BUSY", "OFFLINE"):
+            return jsonify({"error": "Invalid availability_status (use AVAILABLE, BUSY, OFFLINE)"}), 400
+        updates.append("availability_status=?")
+        params.append(status)
+    if not updates:
+        return jsonify({"error": "Nothing to update (allowed: preferred_language, availability_status)"}), 400
+    conn = get_db()
+    params.append(g.user["uid"])
+    conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=?", params)
+    audit_log(conn, "UPDATE_PROFILE", "user", g.user["uid"], actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={k: v for k, v in data.items() if k in ("preferred_language", "availability_status")})
+    conn.commit()
     user = conn.execute("SELECT * FROM users WHERE id=?", (g.user["uid"],)).fetchone()
     conn.close()
     return jsonify(public_user(user))
@@ -2199,7 +2286,15 @@ def list_diseases():
 
 
 # ------------------------------------------------- AI early warning (govt) --
-ML_BACKEND = os.environ.get("SIH_ML_BACKEND", "http://127.0.0.1:8000")
+def _ml_backend_base():
+    raw = (os.environ.get("SIH_ML_BACKEND") or "http://127.0.0.1:8000").strip().rstrip("/")
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        # Render `fromService: host` may inject a bare hostname; production is HTTPS.
+        raw = "https://" + raw
+    return raw
+
+
+ML_BACKEND = _ml_backend_base()
 
 
 def _ml_post(path, payload):
@@ -2722,9 +2817,14 @@ def ivr_info_public():
     })
 
 if __name__ == "__main__":
-    init_db()
-    print("Database ready at", os.path.join(os.path.dirname(__file__), "animal_health.db"))
-    from ivr.config import get_ivr_config_summary
-    print("IVR Config:", get_ivr_config_summary())
-    print(f"Starting app on http://0.0.0.0:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=True)
+    # init_db() already ran at import; this block is the local dev server only.
+    try:
+        from ivr.config import get_ivr_config_summary
+        print("IVR Config:", get_ivr_config_summary())
+    except Exception:
+        pass
+    _debug_env = os.environ.get("FLASK_DEBUG", "")
+    # Preserve local default (debug on port 5001) but never debug in production.
+    DEBUG = (_debug_env.lower() in ("1", "true", "yes")) if _debug_env else (PORT == 5001)
+    print(f"Starting app on http://0.0.0.0:{PORT} (debug={DEBUG})")
+    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)

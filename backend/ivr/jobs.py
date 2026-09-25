@@ -98,7 +98,8 @@ def _process_ai_summarize(conn, call_sid: str, payload: Dict[str, Any]):
             except Exception:
                 pass
     if report:
-        conn.execute("UPDATE ivr_reports SET status='AI_SUMMARIZED', updated_at=datetime('now') WHERE id=?", (report["id"],))
+        # Never overwrite terminal/triage statuses decided at creation.
+        conn.execute("UPDATE ivr_reports SET status='AI_SUMMARIZED', updated_at=datetime('now') WHERE id=? AND status NOT IN ('DUPLICATE_FLAGGED','RESOLVED','CLOSED')", (report["id"],))
     return {"ai_summarized": True, "call_sid": call_sid}
 
 def _process_transcribe(conn, call_sid: str, payload: Dict[str, Any]):

@@ -121,12 +121,10 @@ def get_location_from_responses(responses: Dict[str, Any]) -> Dict[str, Any]:
             # Instead, caller can use district centroid for map display with disclaimer
             pass
 
-    # If state/district provided via DTMS choice 1 = Maharashtra
-    if district and not village:
-        # Still farmer provided
-        if source == "NOT_AVAILABLE":
-            source = "FARMER_PROVIDED"
-            accuracy = "Low - District only"
+    # District-only answers are honest district-level precision, not a village fix.
+    if district and not village and source in ("NOT_AVAILABLE", "FARMER_PROVIDED"):
+        source = "DISTRICT_LEVEL"
+        accuracy = "District level only - no village fix"
 
     return {
         "village": village or "Not provided",
