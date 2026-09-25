@@ -435,7 +435,6 @@ function loginForm(role) {
     <div class="field"><label>Password</label><input name="password" type="password" required /></div>
     <button class="btn btn-primary" type="submit">${t("btn.login")}</button>
     <div class="auth-switch">${t("auth.newHere")} <a onclick="location.hash='#/register/${role}'">${t("auth.createAccount")}</a></div>
-    <div class="demo-box"><b>Demo Account:</b> ${role === "owner" ? "rajesh@example.com" : role === "vet" ? "vet1@example.com" : role === "lab" ? "lab@example.com" : "govt@example.com"} / password123</div>
   </form>`;
 }
 
