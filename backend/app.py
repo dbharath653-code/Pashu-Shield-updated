@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import re
 import uuid
 import jwt
 import sqlite3
@@ -100,9 +101,17 @@ def auth_required(roles=None):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer "):
+            token = auth.split(" ", 1)[1] if auth.startswith("Bearer ") else ""
+            if not token:
+                # Fallback for intermediaries that strip the Authorization
+                # header (observed: login 200 then dashboard 401 "Missing or
+                # invalid Authorization header" via proxied preview). The
+                # frontend only sends ?access_token= after a header-based 401,
+                # and the header form is always preferred when present.
+                token = request.args.get("access_token", "")
+            if not token:
                 return jsonify({"error": "Missing or invalid Authorization header"}), 401
-            payload = decode_token(auth.split(" ", 1)[1])
+            payload = decode_token(token)
             if not payload:
                 return jsonify({"error": "Invalid or expired token"}), 401
             if roles and payload["role"] not in roles:
@@ -233,11 +242,16 @@ def register():
     preferred_language = (data.get("preferred_language") or "").strip().lower() or None
     if preferred_language and preferred_language not in ("en", "te", "hi", "mr"):
         return jsonify({"error": "Invalid preferred_language (use en, te, hi, mr)"}), 400
+    # Normalise identity fields so later logins match what the user typed here.
+    email_norm = str(data["email"]).strip().lower()
+    mobile_norm = re.sub(r"[\s\-]", "", str(data["mobile"]).strip())
+    name_norm = str(data["full_name"]).strip()
 
     conn = get_db()
     try:
         existing = conn.execute(
-            "SELECT id FROM users WHERE email=? OR mobile=?", (data["email"], data["mobile"])
+            "SELECT id FROM users WHERE LOWER(email)=LOWER(?) OR REPLACE(REPLACE(mobile,' ',''),'-','')=?",
+            (email_norm, mobile_norm),
         ).fetchone()
         if existing:
             return jsonify({"error": "An account with this email or mobile already exists"}), 409
@@ -246,9 +260,12 @@ def register():
         cur = conn.execute(
             "INSERT INTO users (full_name, mobile, email, password_hash, salt, role, specialization, village, block, district, state, preferred_language) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (data["full_name"], data["mobile"], data["email"], pw_hash, salt, data["role"],
-             data.get("specialization"), data.get("village"), data.get("block"),
-             data.get("district"), data.get("state", "Maharashtra"), preferred_language),
+            (name_norm, mobile_norm, email_norm, pw_hash, salt, data["role"],
+             (data.get("specialization") or None) and str(data.get("specialization")).strip(),
+             (data.get("village") or None) and str(data.get("village")).strip(),
+             (data.get("block") or None) and str(data.get("block")).strip(),
+             str(data.get("district") or "").strip(),
+             str(data.get("state") or "Maharashtra").strip(), preferred_language),
         )
         user_id = cur.lastrowid
         audit_log(conn, "REGISTER_USER", "user", user_id, actor_id=user_id,
@@ -267,14 +284,18 @@ def register():
 @app.post("/api/auth/login")
 def login():
     data = request.get_json(force=True) or {}
-    identifier = data.get("identifier") or data.get("email") or data.get("mobile")
+    # Tolerant identifier: phone keyboards add trailing spaces / autocapitalise.
+    # Email matches case-insensitively; mobile matches ignoring spaces/dashes.
+    identifier = str(data.get("identifier") or data.get("email") or data.get("mobile") or "").strip()
     password = data.get("password")
     if not identifier or not password:
         return jsonify({"error": "Email/mobile and password are required"}), 400
+    mobile_norm = re.sub(r"[\s\-]", "", identifier)
 
     conn = get_db()
     user = conn.execute(
-        "SELECT * FROM users WHERE email=? OR mobile=?", (identifier, identifier)
+        "SELECT * FROM users WHERE LOWER(email)=LOWER(?) OR REPLACE(REPLACE(mobile,' ',''),'-','')=?",
+        (identifier, mobile_norm),
     ).fetchone()
     if not user or not verify_password(password, user["salt"], user["password_hash"]):
         conn.close()
