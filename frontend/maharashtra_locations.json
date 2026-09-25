@@ -1,0 +1,12 @@
+[
+  {"district": "Pune", "lat": 18.5204, "lng": 73.8567},
+  {"district": "Satara", "lat": 17.6805, "lng": 74.0183},
+  {"district": "Aurangabad", "lat": 19.8762, "lng": 75.3433},
+  {"district": "Nagpur", "lat": 21.1458, "lng": 79.0882},
+  {"district": "Nashik", "lat": 20.0110, "lng": 73.7903},
+  {"district": "Nanded", "lat": 19.1383, "lng": 77.3210},
+  {"district": "Latur", "lat": 18.4088, "lng": 76.5604},
+  {"district": "Solapur", "lat": 17.6599, "lng": 75.9064},
+  {"district": "Kolhapur", "lat": 16.7050, "lng": 74.2433},
+  {"district": "Ahmednagar", "lat": 19.0952, "lng": 74.7496}
+]

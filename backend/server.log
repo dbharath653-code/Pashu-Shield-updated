@@ -1,0 +1,69 @@
+Database ready at C:\Users\SurFace\Documents\Qoder\2026-09-22\b4adec1b\PashuMitra\backend\animal_health.db
+Starting app on http://0.0.0.0:5001
+ * Serving Flask app 'app'
+ * Debug mode: on
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://172.20.10.3:5001
+Press CTRL+C to quit
+ * Restarting with watchdog (windowsapi)
+ * Debugger is active!
+ * Debugger PIN: 946-863-875
+127.0.0.1 - - [23/Sep/2026 18:04:52] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:05:23] "GET / HTTP/1.1" 304 -
+127.0.0.1 - - [23/Sep/2026 18:05:23] "GET /style.css HTTP/1.1" 304 -
+127.0.0.1 - - [23/Sep/2026 18:05:23] "GET /app.js HTTP/1.1" 304 -
+127.0.0.1 - - [23/Sep/2026 18:05:23] "GET /favicon.ico HTTP/1.1" 404 -
+127.0.0.1 - - [23/Sep/2026 18:05:23] "GET /api/owner/summary HTTP/1.1" 401 -
+C:\Users\SurFace\Documents\Qoder\2026-09-22\b4adec1b\PashuMitra\backend\app.py:30: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "exp": datetime.utcnow() + timedelta(hours=TOKEN_EXP_HOURS),
+127.0.0.1 - - [23/Sep/2026 18:35:56] "POST /api/auth/login HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:35:56] "GET /api/owner/summary HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:36:00] "GET /api/animals HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:36:02] "GET /api/owner/summary HTTP/1.1" 200 -
+ * Detected change in 'C:\\Users\\SurFace\\Documents\\Qoder\\2026-09-22\\b4adec1b\\PashuMitra\\backend\\app.py', reloading
+127.0.0.1 - - [23/Sep/2026 18:36:07] "GET /api/herds HTTP/1.1" 200 -
+Database ready at C:\Users\SurFace\Documents\Qoder\2026-09-22\b4adec1b\PashuMitra\backend\animal_health.db
+Starting app on http://0.0.0.0:5001
+Exception in thread Thread-2 (serve_forever):
+ * Restarting with watchdog (windowsapi)
+ * Debugger is active!
+ * Debugger PIN: 946-863-875
+127.0.0.1 - - [23/Sep/2026 18:37:08] "POST /api/animals HTTP/1.1" 201 -
+127.0.0.1 - - [23/Sep/2026 18:37:08] "GET /api/animals/5 HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:37:15] "GET /api/animals HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:37:15] "GET /api/vets HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:37:16] "GET /whisper-worker.js HTTP/1.1" 304 -
+127.0.0.1 - - [23/Sep/2026 18:37:17] "GET /wasm/ort-wasm-simd.wasm HTTP/1.1" 304 -
+127.0.0.1 - - [23/Sep/2026 18:37:49] "POST /api/cases HTTP/1.1" 201 -
+127.0.0.1 - - [23/Sep/2026 18:37:49] "GET /api/cases/3 HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:38:48] "GET /api/animals HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:38:48] "GET /api/vets HTTP/1.1" 200 -
+C:\Users\SurFace\Documents\Qoder\2026-09-22\b4adec1b\PashuMitra\backend\app.py:30: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "exp": datetime.utcnow() + timedelta(hours=TOKEN_EXP_HOURS),
+127.0.0.1 - - [23/Sep/2026 18:39:28] "POST /api/auth/login HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:39:28] "GET /api/vet/summary HTTP/1.1" 200 -
+ * Detected change in 'C:\\Users\\SurFace\\Documents\\Qoder\\2026-09-22\\b4adec1b\\PashuMitra\\backend\\app.py', reloading
+Database ready at C:\Users\SurFace\Documents\Qoder\2026-09-22\b4adec1b\PashuMitra\backend\animal_health.db
+Starting app on http://0.0.0.0:5001
+127.0.0.1 - - [23/Sep/2026 18:39:34] "GET /api/notifications HTTP/1.1" 200 -
+ * Restarting with watchdog (windowsapi)
+ * Debugger is active!
+ * Debugger PIN: 946-863-875
+127.0.0.1 - - [23/Sep/2026 18:39:38] "GET /api/vet/summary HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:39:40] "GET /api/vet/reports HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:39:42] "GET /api/cases/3 HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:39:48] "GET /api/vet/summary HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:39:50] "GET /api/vet/reports HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:39:51] "GET /api/cases HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:39:56] "GET /api/campaigns HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:39:59] "GET /api/campaigns HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:40:01] "GET /api/notifications HTTP/1.1" 200 -
+127.0.0.1 - - [23/Sep/2026 18:40:04] "GET /api/vet/summary HTTP/1.1" 200 -
+ * Detected change in 'C:\\Users\\SurFace\\Documents\\Qoder\\2026-09-22\\b4adec1b\\PashuMitra\\backend\\database.py', reloading
+Database ready at C:\Users\SurFace\Documents\Qoder\2026-09-22\b4adec1b\PashuMitra\backend\animal_health.db
+Starting app on http://0.0.0.0:5001
+ * Restarting with watchdog (windowsapi)
+ * Debugger is active!
+ * Debugger PIN: 946-863-875

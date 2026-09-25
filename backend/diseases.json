@@ -1,0 +1,159 @@
+[
+ {
+  "id": "D-001",
+  "name_en": "Foot-and-Mouth Disease (FMD)",
+  "name_mr": "लाळ्या खुरकूत",
+  "scientificName": "Apthovirus",
+  "aliases": [
+   "FMD",
+   "Hoof and Mouth"
+  ],
+  "category": "Viral",
+  "affectedSpecies": [
+   "Cattle",
+   "Buffalo",
+   "Pig",
+   "Sheep",
+   "Goat"
+  ],
+  "riskLevel": "Critical",
+  "zoonotic": false,
+  "vaccinePreventable": true,
+  "description_en": "A highly contagious viral disease of cloven-hoofed animals causing significant economic losses.",
+  "description_mr": "खूर असलेल्या प्राण्यांचा अत्यंत सांसर्गिक विषाणूजन्य आजार ज्यामुळे मोठ्या प्रमाणात आर्थिक नुकसान होते.",
+  "symptoms_en": [
+   "Fever",
+   "Blisters in mouth and on feet",
+   "Drop in milk production",
+   "Lameness",
+   "Excessive salivation"
+  ],
+  "symptoms_mr": [
+   "ताप",
+   "तोंडात आणि पायांवर फोड",
+   "दूध उत्पादनात घट",
+   "लंगडेपणा",
+   "जास्त लाळ गळणे"
+  ],
+  "transmission_en": "Direct contact with infected animals, contaminated aerosols, equipment, and vehicles.",
+  "transmission_mr": "संक्रमित प्राण्यांशी थेट संपर्क, दूषित हवा, उपकरणे आणि वाहने यांच्याद्वारे.",
+  "prevention_en": "Strict biosecurity, movement control of infected animals, and routine biannual vaccination.",
+  "prevention_mr": "कडक जैवसुरक्षा, संक्रमित प्राण्यांच्या हालचालींवर नियंत्रण आणि नियमित सहामाही लसीकरण."
+ },
+ {
+  "id": "D-002",
+  "name_en": "Lumpy Skin Disease (LSD)",
+  "name_mr": "लंपी त्वचा रोग",
+  "scientificName": "Capripoxvirus",
+  "aliases": [
+   "LSD",
+   "Neethling virus"
+  ],
+  "category": "Viral",
+  "affectedSpecies": [
+   "Cattle",
+   "Buffalo"
+  ],
+  "riskLevel": "High",
+  "zoonotic": false,
+  "vaccinePreventable": true,
+  "description_en": "A viral disease characterized by fever, enlarged lymph nodes, and multiple skin nodules.",
+  "description_mr": "ताप, वाढलेल्या लिम्फ नोड्स आणि त्वचेवर अनेक गाठी द्वारे वैशिष्ट्यीकृत विषाणूजन्य रोग.",
+  "symptoms_en": [
+   "High fever",
+   "Nodules (2-5 cm) on skin",
+   "Swollen lymph nodes",
+   "Loss of appetite",
+   "Reduced milk yield"
+  ],
+  "symptoms_mr": [
+   "तीव्र ताप",
+   "त्वचेवर गाठी (2-5 सेमी)",
+   "सुजलेल्या लिम्फ नोड्स",
+   "भूक न लागणे",
+   "दुधाचे उत्पादन कमी होणे"
+  ],
+  "transmission_en": "Blood-feeding arthropod vectors like mosquitoes, biting flies, and ticks.",
+  "transmission_mr": "रक्त शोषक कीटक जसे की डास, माश्या आणि गोचीड यांच्याद्वारे.",
+  "prevention_en": "Vector control using insect repellents, strict quarantine of new animals, and ring vaccination around outbreak zones.",
+  "prevention_mr": "कीटकनाशकांचा वापर करून कीटक नियंत्रण, नवीन प्राण्यांचे कडक अलगीकरण आणि प्रादुर्भाव क्षेत्राभोवती लसीकरण."
+ },
+ {
+  "id": "D-003",
+  "name_en": "Brucellosis",
+  "name_mr": "ब्रुसेलोसिस (संसर्गजन्य गर्भपात)",
+  "scientificName": "Brucella abortus",
+  "aliases": [
+   "Contagious Abortion",
+   "Bang's Disease"
+  ],
+  "category": "Zoonotic",
+  "affectedSpecies": [
+   "Cattle",
+   "Buffalo",
+   "Sheep",
+   "Goat",
+   "Pig"
+  ],
+  "riskLevel": "High",
+  "zoonotic": true,
+  "vaccinePreventable": true,
+  "description_en": "A highly contagious zoonotic infection causing reproductive failures and significant public health concerns.",
+  "description_mr": "एक अत्यंत सांसर्गिक झुनोटिक संसर्ग ज्यामुळे प्रजनन अपयश आणि महत्त्वपूर्ण सार्वजनिक आरोग्य समस्या निर्माण होतात.",
+  "symptoms_en": [
+   "Abortion during late pregnancy",
+   "Retained placenta",
+   "Infertility",
+   "Joint pain/swelling"
+  ],
+  "symptoms_mr": [
+   "गर्भधारणेच्या उत्तरार्धात गर्भपात",
+   "वार अडकणे",
+   "वंध्यत्व",
+   "सांधेदुखी/सूज"
+  ],
+  "transmission_en": "Ingestion of contaminated feed/water, direct contact with aborted fetuses, and venereal transmission.",
+  "transmission_mr": "दूषित चारा/पाणी ग्रहण करणे, गर्भपात झालेल्या गर्भाशी थेट संपर्क आणि वीर्याद्वारे प्रसार.",
+  "prevention_en": "Calfhood vaccination, testing and culling of positive animals, and use of protective gear by handlers.",
+  "prevention_mr": "वासरांचे लसीकरण, बाधित प्राण्यांची तपासणी करून विल्हेवाट लावणे आणि हाताळणाऱ्यांकडून संरक्षणात्मक उपकरणांचा वापर."
+ },
+ {
+  "id": "D-004",
+  "name_en": "Peste des Petits Ruminants (PPR)",
+  "name_mr": "पीपीआर (शेळ्या-मेंढ्यांचा प्लेग)",
+  "scientificName": "Small ruminant morbillivirus",
+  "aliases": [
+   "PPR",
+   "Goat Plague",
+   "Ovine Rinderpest"
+  ],
+  "category": "Viral",
+  "affectedSpecies": [
+   "Sheep",
+   "Goat"
+  ],
+  "riskLevel": "High",
+  "zoonotic": false,
+  "vaccinePreventable": true,
+  "description_en": "A severe, fast-spreading viral disease of sheep and goats characterized by high morbidity and mortality.",
+  "description_mr": "शेळ्या आणि मेंढ्यांचा एक गंभीर, वेगाने पसरणारा विषाणूजन्य आजार ज्यामध्ये मृत्यूचे प्रमाण जास्त असते.",
+  "symptoms_en": [
+   "High fever",
+   "Discharge from eyes and nose",
+   "Sores in mouth",
+   "Severe diarrhea",
+   "Pneumonia"
+  ],
+  "symptoms_mr": [
+   "तीव्र ताप",
+   "डोळे आणि नाकातून स्त्राव",
+   "तोंडात फोड",
+   "तीव्र अतिसार",
+   "न्यूमोनिया"
+  ],
+  "transmission_en": "Direct contact with infected animals, especially through respiratory secretions and feces.",
+  "transmission_mr": "संक्रमित प्राण्यांशी थेट संपर्क, विशेषत: श्वासोच्छवासाचे स्त्राव आणि विष्ठेद्वारे.",
+  "prevention_en": "Mass vaccination campaigns, isolation of sick animals, and safe disposal of carcasses.",
+  "prevention_mr": "सामूहिक लसीकरण मोहिमा, आजारी प्राण्यांचे अलगीकरण आणि मृतदेहांची सुरक्षित विल्हेवाट."
+ }
+]
