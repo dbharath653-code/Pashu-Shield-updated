@@ -2777,21 +2777,23 @@ ownerDashboard = async function() {
   const appEl = document.getElementById("app");
   if (!appEl || document.getElementById("ivr-owner-extra")) return;
   try {
-    const ivrInfo = await api("/ivr/info").catch(()=>null);
-    const ivrNum = ivrInfo && ivrInfo.config ? ivrInfo.config.ivr_phone_number : "Not configured";
+    const hl = await helplineInfo();
     const extra = document.createElement("div");
     extra.id = "ivr-owner-extra";
     extra.innerHTML = `
       <div class="section-card">
-        <div class="section-title">📞 IVR Helpline</div>
-        <div class="meta">You can also report animal health issues by calling the PashuMitra IVR helpline. No smartphone required.</div>
+        <div class="section-title">📞 Need Veterinary Help?</div>
+        <div class="meta">Call the Pashu-Shield Helpline from your mobile phone. No smartphone required. Multilingual: English · Telugu · Hindi · Marathi.</div>
         <div style="margin-top:10px;background:#e7effe;border-radius:12px;padding:12px;text-align:center">
-          <div style="font-size:13px;color:var(--muted)">IVR Phone Number</div>
-          <div style="font-size:18px;font-weight:800;color:var(--primary)">${ivrNum}</div>
-          <div class="small-muted" style="margin-top:4px">Multilingual: English · Telugu · Hindi · Marathi · Press 9 to repeat, 0 to go back</div>
+          <div style="font-size:13px;color:var(--muted)">Pashu-Shield Helpline</div>
+          <div style="font-size:22px;font-weight:800;color:var(--primary)"><a href="tel:${hl.e164}" style="color:var(--primary);text-decoration:none">${hl.number}</a></div>
+          <div class="small-muted" style="margin-top:4px">${hl.displayIn} · Call from your mobile phone</div>
         </div>
-        <div class="btn-row" style="margin-top:12px">
-          <button class="btn btn-ghost btn-sm" onclick="location.hash='#/owner/ivr-reports'">View My IVR Reports</button>
+        <div style="margin-top:12px">
+          <a class="btn btn-primary" style="text-decoration:none" href="tel:${hl.e164}">📞 CALL NOW</a>
+        </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button class="btn btn-ghost btn-sm" onclick="location.hash='#/owner/ivr-reports'">View My Phone Reports</button>
         </div>
       </div>`;
     const bnav = appEl.querySelector(".bottom-nav");
@@ -3061,3 +3063,50 @@ route("#/govt/ivr-config", async () => {
 
 // Owner IVR reports are via ivrReportsView("owner") already registered above
 
+
+// ======================================================== PASHU-SHIELD HELPLINE (CLICK-TO-CALL) ==
+// Fixed official helpline. The number is served by backend config (/api/ivr/info);
+// these fallback constants match the production default so the UI renders instantly.
+// Tapping CALL NOW opens the device's native dialer (tel: link) - the browser
+// never places or receives the cellular call itself.
+const HELPLINE_FALLBACK = { number: "7382210251", e164: "+917382210251", displayIn: "+91 73822 10251" };
+let _helplineCache = null;
+async function helplineInfo() {
+  if (_helplineCache) return _helplineCache;
+  try {
+    const info = await api("/ivr/info").catch(() => null);
+    const cfg = (info && info.config) || {};
+    const digits = String(cfg.helpline_number || cfg.ivr_phone_number || "").replace(/\D/g, "");
+    if (digits.length >= 10) {
+      const local = digits.slice(-10);
+      _helplineCache = { number: local, e164: "+91" + local, displayIn: "+91 " + local.slice(0, 5) + " " + local.slice(5) };
+      return _helplineCache;
+    }
+  } catch (e) {}
+  _helplineCache = HELPLINE_FALLBACK;
+  return _helplineCache;
+}
+
+// Helpline strip on the public landing page (logged-out farmers) - non-destructive.
+const _origRenderRoleSelect = renderRoleSelect;
+renderRoleSelect = async function() {
+  _origRenderRoleSelect();
+  try {
+    const appEl = document.getElementById("app");
+    if (!appEl || document.getElementById("helpline-landing")) return;
+    const wrap = appEl.querySelector(".auth-wrap");
+    if (!wrap) return;
+    const hl = await helplineInfo();
+    const strip = document.createElement("div");
+    strip.id = "helpline-landing";
+    strip.className = "section-card";
+    strip.style.textAlign = "center";
+    strip.innerHTML = `
+      <div style="font-size:13px;color:var(--muted)">🐄 Need Veterinary Help? Call the</div>
+      <div style="font-weight:800;font-size:16px;margin:2px 0">Pashu-Shield Helpline</div>
+      <div style="font-size:20px;font-weight:800"><a id="helpline-landing-num" href="tel:${hl.e164}" style="color:var(--primary);text-decoration:none">${hl.number}</a></div>
+      <div class="small-muted" id="helpline-landing-sub">${hl.displayIn} · Call from your mobile phone</div>
+      <div style="margin-top:10px"><a class="btn btn-primary btn-sm" style="text-decoration:none" href="tel:${hl.e164}">📞 CALL NOW</a></div>`;
+    wrap.appendChild(strip);
+  } catch (e) {}
+};

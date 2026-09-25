@@ -66,7 +66,37 @@ Seed logins (change/remove after first production login):
 `rajesh@example.com` (owner), `vet1@example.com` (vet),
 `govt@example.com` (govt), `lab@example.com` (lab) — password `password123`.
 
-## 3. IVR production wiring (Twilio / Exotel)
+## 3. Helpline 7382210251 (click-to-call + regional routing)
+
+The official Pashu-Shield helpline is **7382210251** (displayed as
+**+91 73822 10251**). It is the default of `IVR_PHONE_NUMBER` (backend config
++ `render.yaml`), served to the frontend via the public `/api/ivr/info`
+endpoint (no secrets), and rendered as a native-dialer link:
+
+```html
+<a href="tel:+917382210251">CALL NOW</a>
+```
+
+Farmer journey: landing page / owner dashboard shows the number -> tap
+CALL NOW -> the phone's native dialer opens with +917382210251 -> farmer
+calls -> (once PSTN is terminated, §4) the application identifies the farmer
+by caller ID, reuses the saved language, resolves the region from the
+verified profile, routes to an available same-region veterinarian, and falls
+back to the multilingual survey (skipping already-known questions) that
+auto-creates a `HELPLINE` report + case, notifies the vet, and surfaces in
+the government portal, GIS, and analytics.
+
+**Telephony reality (no fabrication):** a website cannot by itself receive a
+PSTN/cellular call. The `tel:` link only opens the farmer's native dialer;
+the browser never places or receives the cellular call. PSTN termination of
+7382210251 on the application's voice webhooks requires a carrier/SIP-trunk
+service pointed at `https://<backend-host>/api/ivr/webhook/call`. Until that
+carrier dependency is provisioned, the full application-side workflow (mock
+transport) is implemented and tested, but live cellular calls to 7382210251
+cannot reach the system — and `GET /api/ivr/info` honestly reports
+`"pstn_connected": false`. No Twilio/Exotel SDKs or credentials are used.
+
+## 4. IVR production wiring (Twilio / Exotel)
 
 1. In the backend service environment, set `TELEPHONY_PROVIDER=twilio` (or
    `exotel`) plus `TELEPHONY_ACCOUNT_ID`, `TELEPHONY_AUTH_TOKEN`,
@@ -84,7 +114,7 @@ Seed logins (change/remove after first production login):
 Without provider credentials the IVR APIs still run in `mock` mode for
 testing (`POST /api/ivr/mock/call`), but no real phone calls can arrive.
 
-## 4. Local / staging run (mirrors production)
+## 5. Local / staging run (mirrors production)
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt -r ml-backend/requirements.txt
@@ -96,7 +126,7 @@ cd backend && SIH_ML_BACKEND=http://127.0.0.1:8000 ../.venv/bin/gunicorn app:app
 # open http://localhost:5001  |  health: /api/health  |  ML: http://localhost:8000/health
 ```
 
-## 5. Production notes
+## 6. Production notes
 
 * `SIH_DB_PATH` overrides the SQLite location (Render disk). Locally the
   default `backend/animal_health.db` is used and auto-created.

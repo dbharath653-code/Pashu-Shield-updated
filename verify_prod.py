@@ -150,6 +150,43 @@ check("GET /api/ivr/reports", r.status_code == 200, f"{r.status_code} {r.text[:1
 r = requests.get(f"{BASE}/api/ivr/analytics", headers=H(tokens["govt"]))
 check("GET /api/ivr/analytics", r.status_code == 200, f"{r.status_code} {r.text[:150]}")
 
+# --- Helpline 7382210251 (fixed number, click-to-call, routing) ---
+r = requests.get(f"{BASE}/api/ivr/info")
+_cfg = (r.json().get("config") or {}) if r.status_code == 200 else {}
+check("GET /api/ivr/info helpline=7382210251",
+      r.status_code == 200 and _cfg.get("helpline_number") == "7382210251"
+      and _cfg.get("helpline_e164") == "+917382210251"
+      and _cfg.get("pstn_connected") is False, f"{r.status_code} {r.text[:200]}")
+r = requests.get(f"{BASE}/app.js")
+check("frontend tel:+917382210251 link", r.status_code == 200 and "tel:" in r.text and "7382210251" in r.text,
+      str(r.status_code))
+r = requests.post(f"{BASE}/api/ivr/mock/call", json={"from": "+919800099001", "to": "7382210251"})
+_hl_sid = (r.json().get("call_sid") or "") if r.status_code == 200 else ""
+check("helpline mock call accepted", bool(_hl_sid), f"{r.status_code} {r.text[:200]}")
+if _hl_sid:
+    r = requests.post(f"{BASE}/api/ivr/webhook/language?call_sid={_hl_sid}", data={"Digits": "2"})
+    check("helpline Telugu menu", r.status_code == 200 and "nokkandi" in r.text.lower(),
+          f"{r.status_code} {r.text[:200]}")
+    r = requests.post(f"{BASE}/api/ivr/webhook/menu?call_sid={_hl_sid}", data={"Digits": "1"})
+    check("helpline vet routing (Dial or fallback survey)", r.status_code == 200 and
+          ("dial" in r.text.lower() or "survey" in r.text.lower() or "question" in r.text.lower()),
+          f"{r.status_code} {r.text[:200]}")
+    requests.post(f"{BASE}/api/ivr/webhook/call-ended", json={"call_sid": _hl_sid, "duration": 45})
+r = requests.get(f"{BASE}/api/ivr/analytics", headers=H(tokens["govt"]))
+_bych = (r.json().get("by_channel") or []) if r.status_code == 200 else []
+check("analytics by_channel includes HELPLINE",
+      any(b.get("label") == "HELPLINE" for b in _bych), f"{r.status_code} {r.text[:200]}")
+r = requests.put(f"{BASE}/api/users/me", headers=H(tokens["vet"]), json={"availability_status": "BUSY"})
+check("vet can set availability BUSY",
+      r.status_code == 200 and r.json().get("availability_status") == "BUSY",
+      f"{r.status_code} {r.text[:200]}")
+r = requests.put(f"{BASE}/api/users/me", headers=H(tokens["vet"]), json={"availability_status": "AVAILABLE"})
+check("vet availability restored AVAILABLE",
+      r.status_code == 200 and r.json().get("availability_status") == "AVAILABLE",
+      f"{r.status_code} {r.text[:200]}")
+r = requests.put(f"{BASE}/api/users/me", headers=H(tokens["owner"]), json={"availability_status": "BUSY"})
+check("owner cannot set availability -> 403", r.status_code == 403, f"{r.status_code} {r.text[:200]}")
+
 print(f"\n==== RESULT: {len(PASS)} passed, {len(FAIL)} failed ====")
 if FAIL:
     print("FAILURES:", FAIL)

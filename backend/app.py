@@ -230,6 +230,9 @@ def register():
         return jsonify({"error": "Password must be at least 6 characters"}), 400
     if data["role"] not in ("owner", "vet", "govt", "lab"):
         return jsonify({"error": "Invalid role"}), 400
+    preferred_language = (data.get("preferred_language") or "").strip().lower() or None
+    if preferred_language and preferred_language not in ("en", "te", "hi", "mr"):
+        return jsonify({"error": "Invalid preferred_language (use en, te, hi, mr)"}), 400
 
     conn = get_db()
     try:
@@ -241,11 +244,11 @@ def register():
 
         pw_hash, salt = hash_password(data["password"])
         cur = conn.execute(
-            "INSERT INTO users (full_name, mobile, email, password_hash, salt, role, specialization, village, block, district, state) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO users (full_name, mobile, email, password_hash, salt, role, specialization, village, block, district, state, preferred_language) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (data["full_name"], data["mobile"], data["email"], pw_hash, salt, data["role"],
              data.get("specialization"), data.get("village"), data.get("block"),
-             data.get("district"), data.get("state", "Maharashtra")),
+             data.get("district"), data.get("state", "Maharashtra"), preferred_language),
         )
         user_id = cur.lastrowid
         audit_log(conn, "REGISTER_USER", "user", user_id, actor_id=user_id,
@@ -290,6 +293,41 @@ def login():
 @auth_required()
 def me():
     conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (g.user["uid"],)).fetchone()
+    conn.close()
+    return jsonify(public_user(user))
+
+
+@app.put("/api/users/me")
+@auth_required()
+def update_me():
+    """Self-service profile update (strict whitelist): preferred language for
+    all roles; helpline availability override for vets only."""
+    data = request.get_json(force=True) or {}
+    updates, params = [], []
+    if "preferred_language" in data:
+        lang = (data.get("preferred_language") or "").strip().lower() or None
+        if lang and lang not in ("en", "te", "hi", "mr"):
+            return jsonify({"error": "Invalid preferred_language (use en, te, hi, mr)"}), 400
+        updates.append("preferred_language=?")
+        params.append(lang)
+    if "availability_status" in data:
+        if g.user["role"] != "vet":
+            return jsonify({"error": "Only veterinarians can set availability_status"}), 403
+        status = (data.get("availability_status") or "").strip().upper() or None
+        if status and status not in ("AVAILABLE", "BUSY", "OFFLINE"):
+            return jsonify({"error": "Invalid availability_status (use AVAILABLE, BUSY, OFFLINE)"}), 400
+        updates.append("availability_status=?")
+        params.append(status)
+    if not updates:
+        return jsonify({"error": "Nothing to update (allowed: preferred_language, availability_status)"}), 400
+    conn = get_db()
+    params.append(g.user["uid"])
+    conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=?", params)
+    audit_log(conn, "UPDATE_PROFILE", "user", g.user["uid"], actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={k: v for k, v in data.items() if k in ("preferred_language", "availability_status")})
+    conn.commit()
     user = conn.execute("SELECT * FROM users WHERE id=?", (g.user["uid"],)).fetchone()
     conn.close()
     return jsonify(public_user(user))

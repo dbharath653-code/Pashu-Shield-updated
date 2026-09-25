@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS ivr_calls (
     caller_number_normalized TEXT,
     ivr_phone_number TEXT,
     status TEXT DEFAULT 'INITIATED' CHECK(status IN ('INITIATED','RINGING','IN_PROGRESS','COMPLETED','FAILED','NO_ANSWER','BUSY','CANCELED')),
+    channel TEXT DEFAULT 'IVR' CHECK(channel IN ('IVR','HELPLINE')),
     language TEXT DEFAULT 'en' CHECK(language IN ('en','te','hi','mr')),
     duration_seconds INTEGER DEFAULT 0,
     recording_url TEXT,
@@ -46,6 +47,9 @@ CREATE TABLE IF NOT EXISTS ivr_sessions (
     current_question_index INTEGER DEFAULT 0,
     retry_count INTEGER DEFAULT 0,
     caller_user_id INTEGER REFERENCES users(id),
+    region TEXT,
+    routing_status TEXT,
+    location_source TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -103,7 +107,8 @@ CREATE TABLE IF NOT EXISTS ivr_reports (
     location_state TEXT DEFAULT 'Maharashtra',
     location_lat REAL,
     location_lng REAL,
-    location_source TEXT DEFAULT 'NOT_AVAILABLE' CHECK(location_source IN ('GPS','NETWORK','FARMER_PROVIDED','SMS_LINK','NOT_AVAILABLE')),
+    source TEXT DEFAULT 'IVR' CHECK(source IN ('IVR','HELPLINE')),
+    location_source TEXT DEFAULT 'NOT_AVAILABLE' CHECK(location_source IN ('GPS','NETWORK','SMS_LINK','PROFILE','FARMER_PROVIDED','DISTRICT_LEVEL','UNKNOWN','NOT_AVAILABLE')),
     location_accuracy TEXT,
     farmer_name TEXT,
     is_duplicate INTEGER DEFAULT 0,
@@ -239,6 +244,8 @@ CREATE INDEX IF NOT EXISTS idx_ivr_reports_status ON ivr_reports(status);
 CREATE INDEX IF NOT EXISTS idx_ivr_reports_urgency ON ivr_reports(urgency);
 CREATE INDEX IF NOT EXISTS idx_ivr_reports_district ON ivr_reports(location_district);
 CREATE INDEX IF NOT EXISTS idx_ivr_reports_caller ON ivr_reports(caller_number);
+CREATE INDEX IF NOT EXISTS idx_ivr_reports_call ON ivr_reports(call_sid);
+CREATE INDEX IF NOT EXISTS idx_ivr_reports_source ON ivr_reports(source);
 CREATE INDEX IF NOT EXISTS idx_ivr_transcripts_call ON ivr_transcripts(call_sid);
 CREATE INDEX IF NOT EXISTS idx_ivr_events_call ON ivr_events(call_sid);
 CREATE INDEX IF NOT EXISTS idx_ivr_jobs_status ON ivr_jobs(status, job_type);

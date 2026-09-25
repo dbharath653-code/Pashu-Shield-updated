@@ -34,7 +34,9 @@ services:
       - key: TELEPHONY_PROVIDER
         value: mock
         sync: false
+      # Official Pashu-Shield helpline (fixed). Editable in dashboard if it ever changes.
       - key: IVR_PHONE_NUMBER
+        value: "7382210251"
         sync: false
       - key: TELEPHONY_ACCOUNT_ID
         sync: false

@@ -33,14 +33,24 @@ LANGUAGE_SPEECH = {
     "marathi": "mr", "maharashtra": "mr",
 }
 
+def detect_channel(to_number: str) -> str:
+    """HELPLINE when the dialled number is the Pashu-Shield helpline, else IVR."""
+    try:
+        from ..config import is_helpline_number
+        return "HELPLINE" if is_helpline_number(to_number) else "IVR"
+    except Exception:
+        return "IVR"
+
+
 def create_call_record(conn, provider: str, from_number: str, to_number: str, call_sid: str = None, is_mock: bool = False) -> str:
     if not call_sid:
         call_sid = f"IVR-{uuid.uuid4().hex[:12].upper()}"
     normalized = normalize_phone(from_number)
     ivr_num = to_number or ""
+    channel = detect_channel(to_number)
     conn.execute(
-        "INSERT INTO ivr_calls (call_sid, provider, from_number, to_number, caller_number, caller_number_normalized, ivr_phone_number, status, language, is_mock) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (call_sid, provider, from_number, to_number, from_number, normalized, ivr_num, "IN_PROGRESS", DEFAULT_LANGUAGE, 1 if is_mock else 0)
+        "INSERT INTO ivr_calls (call_sid, provider, from_number, to_number, caller_number, caller_number_normalized, ivr_phone_number, status, channel, language, is_mock) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (call_sid, provider, from_number, to_number, from_number, normalized, ivr_num, "IN_PROGRESS", channel, DEFAULT_LANGUAGE, 1 if is_mock else 0)
     )
     conn.execute("INSERT INTO ivr_sessions (call_sid, current_state, language) VALUES (?,?,?)", (call_sid, STATE_WELCOME, DEFAULT_LANGUAGE))
     conn.execute("INSERT INTO ivr_events (call_sid, event_type, from_state, to_state, details, actor) VALUES (?,?,?,?,?,?)",
@@ -69,7 +79,7 @@ def update_session_state(conn, call_sid: str, new_state: str, language: str = No
         conn.execute("UPDATE ivr_calls SET language=?, updated_at=datetime('now') WHERE call_sid=?", (language, call_sid))
     if extra:
         for k, v in extra.items():
-            if k in ("menu_choice", "vet_id", "vet_connected", "survey_started", "survey_completed", "current_question_key", "current_question_index", "retry_count", "caller_user_id"):
+            if k in ("menu_choice", "vet_id", "vet_connected", "survey_started", "survey_completed", "survey_partial", "current_question_key", "current_question_index", "retry_count", "caller_user_id", "region", "routing_status", "location_source"):
                 fields.append(f"{k}=?")
                 params.append(v)
     params.append(call_sid)
@@ -77,6 +87,58 @@ def update_session_state(conn, call_sid: str, new_state: str, language: str = No
     conn.execute("INSERT INTO ivr_events (call_sid, session_id, event_type, from_state, to_state, details, actor) VALUES (?,?,?,?,?,?,?)",
                  (call_sid, session["id"], "STATE_TRANSITION", old_state, new_state, json.dumps(extra or {}), "system"))
     conn.commit()
+
+def set_routing_status(conn, call_sid: str, status: str, details: Dict[str, Any] = None):
+    """Fine-grained helpline lifecycle status (session-level; the coarse
+    provider call status stays in ivr_calls.status)."""
+    session = get_session(conn, call_sid)
+    if not session:
+        return
+    conn.execute("UPDATE ivr_sessions SET routing_status=?, updated_at=datetime('now') WHERE call_sid=?",
+                 (status, call_sid))
+    conn.execute("INSERT INTO ivr_events (call_sid, session_id, event_type, to_state, details, actor) VALUES (?,?,?,?,?,?)",
+                 (call_sid, session["id"], "ROUTING_STATUS", status, json.dumps(details or {}), "system"))
+    conn.commit()
+
+
+def identify_and_link_caller(conn, call_sid: str) -> Optional[Dict[str, Any]]:
+    """Identify the caller against registered farmers and link the session.
+    Returns the farmer context (user, region, language, animals) or None for
+    unknown callers. Unknown callers keep the full prompt flow."""
+    from .farmer import identify_farmer
+    call = get_call(conn, call_sid)
+    session = get_session(conn, call_sid)
+    if not call or not session:
+        return None
+    farmer = identify_farmer(conn, call.get("caller_number_normalized") or "")
+    if not farmer:
+        set_routing_status(conn, call_sid, "INITIATED", {"identified": False})
+        return None
+    conn.execute("UPDATE ivr_sessions SET caller_user_id=?, region=?, routing_status=?, updated_at=datetime('now') WHERE call_sid=?",
+                 (farmer["user_id"], json.dumps(farmer["region"]), "IDENTIFIED", call_sid))
+    conn.execute("INSERT INTO ivr_events (call_sid, session_id, event_type, details, actor) VALUES (?,?,?,?,?)",
+                 (call_sid, session["id"], "FARMER_IDENTIFIED",
+                  json.dumps({"user_id": farmer["user_id"],
+                              "district": farmer["region"].get("district"),
+                              "language_known": bool(farmer.get("language")),
+                              "animals": len(farmer.get("animals") or [])}), "system"))
+    conn.commit()
+    return farmer
+
+
+def apply_known_language(conn, call_sid: str, farmer: Dict[str, Any]) -> Optional[str]:
+    """Use the farmer's saved language so the language prompt can be skipped."""
+    lang = (farmer or {}).get("language")
+    if lang not in SUPPORTED_LANGUAGES:
+        return None
+    update_session_state(conn, call_sid, STATE_MENU, language=lang)
+    session = get_session(conn, call_sid)
+    conn.execute("INSERT INTO ivr_events (call_sid, session_id, event_type, details) VALUES (?,?,?,?)",
+                 (call_sid, session["id"] if session else None, "LANGUAGE_PREFILLED",
+                  json.dumps({"language": lang, "source": "farmer_profile"})))
+    conn.commit()
+    return lang
+
 
 def set_language(conn, call_sid: str, lang_input: str) -> str:
     """Resolve language from DTMF or speech, persist."""
@@ -100,6 +162,14 @@ def set_language(conn, call_sid: str, lang_input: str) -> str:
     conn.execute("INSERT INTO ivr_events (call_sid, event_type, details) VALUES (?,?,?)",
                  (call_sid, "LANGUAGE_SELECTED", json.dumps({"language": lang, "raw_input": lang_input})))
     conn.commit()
+    # Remember the choice on the farmer profile for future calls.
+    try:
+        from .farmer import save_preferred_language
+        session = get_session(conn, call_sid)
+        if session and session.get("caller_user_id"):
+            save_preferred_language(conn, session["caller_user_id"], lang)
+    except Exception:
+        pass
     return lang
 
 def handle_menu_choice(conn, call_sid: str, choice: str, language: str) -> str:
@@ -121,39 +191,36 @@ def handle_menu_choice(conn, call_sid: str, choice: str, language: str) -> str:
         conn.commit()
         return "invalid"
 
-def find_available_vet(conn, district: str = None) -> Optional[Dict[str, Any]]:
-    """Query vet availability. Reuse existing assignment logic."""
-    # Prefer district-specific vet, otherwise any vet
-    vet = None
-    if district and district != "Not provided":
-        vet = conn.execute("SELECT id, full_name, mobile, district FROM users WHERE role='vet' AND LOWER(district)=LOWER(?) LIMIT 1", (district,)).fetchone()
-    if not vet:
-        # Fallback: any vet who is not overloaded? Choose most recent vet with few active cases
-        # Simple: pick vet with least active cases
-        vets = conn.execute("SELECT id, full_name, mobile, district FROM users WHERE role='vet'").fetchall()
-        if not vets:
-            return None
-        # Count active cases per vet
-        best = None
-        best_load = float('inf')
-        for v in vets:
-            cnt = conn.execute("SELECT COUNT(*) c FROM cases WHERE vet_id=? AND status NOT IN ('CLOSED','RECOVERED')", (v["id"],)).fetchone()["c"]
-            if cnt < best_load:
-                best_load = cnt
-                best = v
-        vet = best
-    return dict(vet) if vet else None
+def find_available_vet(conn, district: str = None, language: str = None,
+                        caller_user_id: int = None, specialization: str = None) -> Optional[Dict[str, Any]]:
+    """Regional routing engine: same district > language > existing assignment
+    > nearby region > least loaded. Unavailable vets are never selected."""
+    from .routing import pick_best_vet
+    best, _ranked = pick_best_vet(conn, district, language, caller_user_id, specialization)
+    return dict(best) if best else None
+
+
+def rank_vets_for_call(conn, district: str = None, language: str = None,
+                       caller_user_id: int = None,
+                       specialization: str = None):
+    """Full ranked candidate list (for routing audit events)."""
+    from .routing import rank_available_vets
+    return rank_available_vets(conn, district, language, caller_user_id, specialization)
+
 
 def is_vet_available(conn, vet: Dict[str, Any]) -> bool:
-    # Simple availability: if vet exists and not too overloaded (e.g., <10 active cases) consider available
-    # In real prod, would check duty roster / presence. For now, deterministic.
+    """True only when the vet's availability status is AVAILABLE."""
     if not vet:
         return False
-    cnt = conn.execute("SELECT COUNT(*) c FROM cases WHERE vet_id=? AND status NOT IN ('CLOSED','RECOVERED')", (vet["id"],)).fetchone()["c"]
-    # If no active overload, available. Also check time-based: use business hours? For demo, always consider available unless overloaded >10
-    if cnt >= 10:
+    from .routing import get_vet_availability, AVAILABLE
+    full = vet if "availability_status" in vet else None
+    if full is None:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (vet.get("id"),)).fetchone()
+        full = dict(row) if row else vet
+    try:
+        return get_vet_availability(conn, full) == AVAILABLE
+    except Exception:
         return False
-    return True
 
 def record_survey_answer(conn, call_sid: str, question_key: str, raw_answer: str, source: str = "dtmf", confidence: float = 1.0, language: str = "en"):
     """Store survey answer with normalization and confirmation."""
@@ -175,7 +242,7 @@ def record_survey_answer(conn, call_sid: str, question_key: str, raw_answer: str
     return normalized
 
 def advance_survey(conn, call_sid: str, current_index: int, responses: Dict[str, Any] = None) -> Optional[str]:
-    """Advance to next question, handling conditionals."""
+    """Advance to next question, handling conditionals + profile prefill."""
     session = get_session(conn, call_sid)
     if not session:
         return None
@@ -183,7 +250,12 @@ def advance_survey(conn, call_sid: str, current_index: int, responses: Dict[str,
     if responses is None:
         rows = conn.execute("SELECT question_key, answer_normalized FROM ivr_survey_responses WHERE call_sid=?", (call_sid,)).fetchall()
         responses = {r["question_key"]: r["answer_normalized"] for r in rows}
-    next_idx = get_next_question_index(current_index, responses)
+    try:
+        from .farmer import get_prefilled_keys
+        prefilled = get_prefilled_keys(conn, call_sid)
+    except Exception:
+        prefilled = []
+    next_idx = get_next_question_index(current_index, responses, prefilled)
     if next_idx >= len(SURVEY_QUESTION_KEYS):
         # Survey complete
         update_session_state(conn, call_sid, STATE_COMPLETED, extra={"survey_completed": 1, "current_question_key": None, "current_question_index": next_idx})
@@ -205,6 +277,15 @@ def handle_call_end(conn, call_sid: str, duration_seconds: int = 0, reason: str 
     # Update call status
     conn.execute("UPDATE ivr_calls SET status='COMPLETED', duration_seconds=?, ended_at=datetime('now'), updated_at=datetime('now') WHERE call_sid=?",
                  (duration_seconds or 0, call_sid))
+    # Honest end-state: ABANDONED when nothing was collected or connected.
+    try:
+        n_resp = conn.execute("SELECT COUNT(*) c FROM ivr_survey_responses WHERE call_sid=?", (call_sid,)).fetchone()["c"]
+        has_report = conn.execute("SELECT id FROM ivr_reports WHERE call_sid=? LIMIT 1", (call_sid,)).fetchone()
+        vet_conn = session.get("vet_connected") if session else 0
+        end_status = "COMPLETED" if (n_resp or has_report or vet_conn) else "ABANDONED"
+        set_routing_status(conn, call_sid, end_status, {"reason": reason})
+    except Exception:
+        pass
     # If survey was started but not completed, mark partial
     if session and session.get("survey_started") and not session.get("survey_completed"):
         # Check how many answers we have
@@ -251,7 +332,8 @@ def get_survey_progress(conn, call_sid: str) -> Dict[str, Any]:
     return {"total": total, "current_index": current, "answered": answered, "current_key": session.get("current_question_key"), "language": session.get("language"), "state": session.get("current_state")}
 
 def vet_call_connected(conn, call_sid: str, vet_id: int, vet_call_sid: str = None):
-    conn.execute("UPDATE ivr_sessions SET vet_id=?, vet_connected=1, vet_call_sid=? WHERE call_sid=?", (vet_id, vet_call_sid, call_sid))
+    conn.execute("UPDATE ivr_sessions SET vet_id=?, vet_connected=1, vet_call_sid=?, routing_status='VET_CONNECTED' WHERE call_sid=?", (vet_id, vet_call_sid, call_sid))
+    conn.execute("UPDATE ivr_calls SET updated_at=datetime('now') WHERE call_sid=?", (call_sid,))
     conn.execute("UPDATE ivr_calls SET status='IN_PROGRESS' WHERE call_sid=?", (call_sid,))
     # Add participant
     vet = conn.execute("SELECT mobile FROM users WHERE id=?", (vet_id,)).fetchone()

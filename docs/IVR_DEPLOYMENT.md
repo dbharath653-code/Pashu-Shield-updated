@@ -14,7 +14,7 @@ This document covers production deployment of the IVR extension (not a rewrite) 
 Set in Render Dashboard → Service → Environment (or `.env` locally):
 
 ```bash
-IVR_PHONE_NUMBER=+919000000000        # Required: public PSTN number shown to farmers
+IVR_PHONE_NUMBER=7382210251            # Official Pashu-Shield helpline (also the app default)
 TELEPHONY_PROVIDER=twilio              # mock | twilio | exotel | plivo
 TELEPHONY_ACCOUNT_ID=ACxxxx            # Provider SID / API key
 TELEPHONY_AUTH_TOKEN=...               # Provider auth token (never commit)

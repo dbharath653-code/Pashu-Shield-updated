@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS users (
     block TEXT,
     district TEXT,
     state TEXT DEFAULT 'Maharashtra',
+    preferred_language TEXT,
+    availability_status TEXT,
     is_seed INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -528,11 +530,74 @@ def calculate_expected_delivery(species: str, breeding_date_str: str) -> str:
     return str(b_date + timedelta(days=days))
 
 
+def ensure_ivr_columns(conn):
+    """Additive IVR columns for existing databases (helpline channel, routing)."""
+    def _add(table, col, coltype):
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+    _add("ivr_calls", "channel", "TEXT DEFAULT 'IVR'")
+    _add("ivr_sessions", "region", "TEXT")
+    _add("ivr_sessions", "routing_status", "TEXT")
+    _add("ivr_sessions", "location_source", "TEXT")
+    _add("ivr_reports", "source", "TEXT DEFAULT 'IVR'")
+    conn.commit()
+
+
+def migrate_ivr_reports_location_source(conn):
+    """Rebuild ivr_reports once to allow PROFILE/DISTRICT_LEVEL/UNKNOWN location
+    sources (SQLite cannot ALTER a CHECK constraint). Data-preserving: copies
+    every existing column by name. No-op when already migrated."""
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='ivr_reports'").fetchone()
+    if not sql_row or not sql_row["sql"]:
+        return
+    if "'PROFILE'" in sql_row["sql"]:
+        return
+    import re
+    from ivr.schema import IVR_SCHEMA
+    m = re.search(r"CREATE TABLE IF NOT EXISTS ivr_reports \(.*?\);\n", IVR_SCHEMA, re.S)
+    if not m:
+        print("migrate_ivr_reports_location_source: DDL not found, skipping")
+        return
+    new_ddl = m.group(0).replace("ivr_reports (", "ivr_reports_new (", 1)
+    old_cols = [r["name"] for r in conn.execute("PRAGMA table_info(ivr_reports)").fetchall()]
+    collist = ", ".join(old_cols)
+    conn.executescript("PRAGMA foreign_keys=OFF;")
+    conn.executescript(new_ddl)
+    conn.execute(f"INSERT INTO ivr_reports_new ({collist}) SELECT {collist} FROM ivr_reports")
+    conn.execute("DROP TABLE ivr_reports")
+    conn.execute("ALTER TABLE ivr_reports_new RENAME TO ivr_reports")
+    conn.executescript(IVR_SCHEMA)  # recreate indexes dropped with the old table
+    conn.executescript("PRAGMA foreign_keys=ON;")
+    conn.commit()
+    print("migrate_ivr_reports_location_source: CHECK expanded (PROFILE/DISTRICT_LEVEL/UNKNOWN)")
+
+
+def ensure_seed_vet_availability(conn):
+    """Seed demo vets are explicitly AVAILABLE so automated tests and demos are
+    deterministic regardless of wall-clock working hours. Real vets default to
+    automatic (hours + call-state) availability."""
+    conn.execute(
+        "UPDATE users SET availability_status='AVAILABLE' "
+        "WHERE role='vet' AND is_seed=1 AND availability_status IS NULL")
+    conn.commit()
+
+
 def init_ivr_schema(conn):
     """Initialize IVR extension tables and default configs."""
     try:
         from ivr.schema import IVR_SCHEMA, DEFAULT_SURVEY_CONFIG_JSON
-        conn.executescript(IVR_SCHEMA)
+        try:
+            conn.executescript(IVR_SCHEMA)
+        except sqlite3.OperationalError:
+            # Old table versions may lack columns referenced by new indexes
+            # (e.g. ivr_reports.source). Add columns first, then re-run; every
+            # statement is IF NOT EXISTS so re-running is safe.
+            ensure_ivr_columns(conn)
+            conn.executescript(IVR_SCHEMA)
+        ensure_ivr_columns(conn)
+        migrate_ivr_reports_location_source(conn)
         # Insert default survey config if empty
         has_cfg = conn.execute("SELECT COUNT(*) c FROM ivr_survey_config WHERE config_key='survey_definition'").fetchone()["c"]
         if not has_cfg:
@@ -581,6 +646,7 @@ def _init_db_inner(reset=False):
     ensure_lab_user(conn)
     ensure_qr_for_existing_animals(conn)
     ensure_extended_seeds(conn)
+    ensure_seed_vet_availability(conn)
     conn.commit()
     # IVR schema (always ensure, even if not first_time, for upgrades)
     init_ivr_schema(conn)
@@ -764,6 +830,13 @@ def ensure_new_columns(conn):
     h_cols = {row["name"] for row in conn.execute("PRAGMA table_info(herds)").fetchall()}
     if "state" not in h_cols:
         conn.execute("ALTER TABLE herds ADD COLUMN state TEXT DEFAULT 'Maharashtra'")
+
+    # users columns (helpline: saved language + vet availability override)
+    u_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "preferred_language" not in u_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN preferred_language TEXT")
+    if "availability_status" not in u_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN availability_status TEXT")
 
     conn.commit()
 
