@@ -133,6 +133,15 @@ and `pstn_connected` honestly stays `false`.
 
 ## 5. Local / staging run (mirrors production)
 
+**One-click:** double-click `run-local.bat` on Windows, or run
+`./run-local.sh` on macOS/Linux. Both scripts create `.venv` on first run,
+install `backend/` + `ml-backend/` requirements, start the ML API
+(uvicorn, port 8000) and the app (`python app.py`, port 5001), and open
+<http://localhost:5001>. The `.sh` variant stops both servers on Ctrl+C;
+the `.bat` variant keeps each server in its own window (open even on crash).
+
+Manual equivalent:
+
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt -r ml-backend/requirements.txt
 # terminal 1 (ML):
