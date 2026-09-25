@@ -1,0 +1,41 @@
+name: Pashu-Shield CI
+
+on:
+  push:
+    branches: [main, 'arena/**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Keep CI's database out of the checkout and make every run disposable.
+      SIH_DB_PATH: ${{ runner.temp }}/pashu-shield/animal_health.db
+      SIH_SECRET_KEY: ci-only-secret
+      TELEPHONY_PROVIDER: mock
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            ml-backend/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r backend/requirements.txt -r ml-backend/requirements.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q backend ml-backend pbx
+
+      - name: Run backend test suite
+        run: python -m unittest discover -s backend -p 'test_*.py' -v
