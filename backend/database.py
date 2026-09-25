@@ -22,7 +22,12 @@ import json
 import uuid
 from datetime import datetime, date, timedelta
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "animal_health.db")
+try:
+    import fcntl  # Unix-only; Windows dev falls back to unlocked init
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+DB_PATH = os.environ.get("SIH_DB_PATH") or os.path.join(os.path.dirname(__file__), "animal_health.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -455,6 +460,10 @@ CREATE INDEX IF NOT EXISTS idx_weather_dist ON weather_observations(district, fe
 
 
 def get_db():
+    # Ensure the DB directory exists (production persistent disk may be an empty mount).
+    _db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if _db_dir and not os.path.isdir(_db_dir):
+        os.makedirs(_db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -536,6 +545,26 @@ def init_ivr_schema(conn):
         print(f"init_ivr_schema warning: {e}")
 
 def init_db(reset=False):
+    """Create schema + seeds. Safe under multi-worker WSGI: an exclusive
+    cross-process file lock ensures only one worker initialises a fresh DB
+    at a time (prevents half-seeded reads and duplicate-seed races)."""
+    if fcntl is not None:
+        _db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+        if _db_dir and not os.path.isdir(_db_dir):
+            os.makedirs(_db_dir, exist_ok=True)
+        with open(DB_PATH + ".init.lock", "w") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            try:
+                return _init_db_inner(reset)
+            finally:
+                try:
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+    return _init_db_inner(reset)
+
+
+def _init_db_inner(reset=False):
     if reset and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
     first_time = not os.path.exists(DB_PATH)
@@ -871,18 +900,23 @@ def ensure_extended_seeds(conn):
                 (case1["id"], case1["animal_id"], vet_id)
             )
 
-    # Seed farm alert if none exists
+    # Seed farm alert if none exists (resolve herd FK by code; skip if herd
+    # seeding hasn't completed yet so a concurrent boot can never FK-fail).
     has_fa = conn.execute("SELECT COUNT(*) c FROM farm_alerts").fetchone()["c"]
     if not has_fa:
-        conn.execute(
-            """
-            INSERT INTO farm_alerts (herd_id, herd_code, district, disease, affected_animals_count, affected_animals_codes, risk_level, trigger_reason, recommended_action, supporting_evidence, status)
-            VALUES (1, 'HERD-MH-PUN-1001', 'Pune', 'HS (suspected)', 1, 'MH-PUN-000001', 'Moderate',
-                    'Active acute respiratory and fever case detected in Wagholi cluster',
-                    'Perform preventive herd ring vaccination and temperature screening',
-                    'Case CASE-000801 with medium severity symptoms reported', 'ACTIVE')
-            """
-        )
+        _herd = conn.execute(
+            "SELECT id FROM herds WHERE herd_code='HERD-MH-PUN-1001'").fetchone()
+        if _herd:
+            conn.execute(
+                """
+                INSERT INTO farm_alerts (herd_id, herd_code, district, disease, affected_animals_count, affected_animals_codes, risk_level, trigger_reason, recommended_action, supporting_evidence, status)
+                VALUES (?, 'HERD-MH-PUN-1001', 'Pune', 'HS (suspected)', 1, 'MH-PUN-000001', 'Moderate',
+                        'Active acute respiratory and fever case detected in Wagholi cluster',
+                        'Perform preventive herd ring vaccination and temperature screening',
+                        'Case CASE-000801 with medium severity symptoms reported', 'ACTIVE')
+                """,
+                (_herd["id"],),
+            )
 
     # Seed national alert if none exists
     has_na = conn.execute("SELECT COUNT(*) c FROM national_alerts").fetchone()["c"]

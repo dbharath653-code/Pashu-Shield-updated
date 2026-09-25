@@ -171,6 +171,12 @@ def register_ivr_routes(app):
     def ivr_voice_alias():
         return ivr_incoming()
 
+    # Canonical production webhook documented in docs/IVR_DEPLOYMENT.md.
+    # Telephony providers (Twilio/Exotel) are configured with this URL.
+    @app.route("/api/ivr/webhook/call", methods=["POST", "GET"])
+    def ivr_call_alias():
+        return ivr_incoming()
+
     @app.route("/api/ivr/webhook/welcome", methods=["POST", "GET"])
     @verify_telephony_signature
     def ivr_welcome():

@@ -41,6 +41,21 @@ PORT = int(os.environ.get("PORT", "5001"))
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
 
+# Production hardening: initialise the database at import time so WSGI servers
+# (gunicorn) that never execute the `__main__` block still get schema + seeds.
+# init_db() is idempotent (CREATE TABLE IF NOT EXISTS); retry once to survive
+# multi-worker cold-start races on a fresh persistent disk.
+try:
+    init_db()
+    import database as _dbmod
+    print(f"Database ready at {_dbmod.DB_PATH}")
+except Exception as _init_err:
+    import time as _time
+    print(f"init_db first attempt failed ({_init_err}); retrying once...")
+    _time.sleep(2)
+    init_db()
+    print("Database ready after retry.")
+
 CASE_STATUSES = [
     "NEW", "ASSIGNED", "UNDER INVESTIGATION", "SAMPLE COLLECTED", "LAB PENDING",
     "DIAGNOSED", "TREATMENT", "FOLLOW-UP", "RECOVERED", "CLOSED"
@@ -180,6 +195,19 @@ def check_allergy_conflict(medicine_name: str, active_allergies: list) -> dict |
 def no_cache_static(resp):
     if request.path in ("/", "/index.html") or request.path.endswith((".js", ".css")):
         resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    # Optional CORS for split deployments (frontend hosted separately).
+    # Same-origin (default: Flask serves frontend) needs nothing. Set
+    # CORS_ORIGINS="https://app.example.com,https://other.example.com" to enable.
+    _cors = os.environ.get("CORS_ORIGINS", "").strip()
+    if _cors:
+        _allowed = [o.strip() for o in _cors.split(",") if o.strip()]
+        _origin = request.headers.get("Origin", "")
+        if _origin in _allowed:
+            resp.headers["Access-Control-Allow-Origin"] = _origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     return resp
 
 
@@ -2199,7 +2227,15 @@ def list_diseases():
 
 
 # ------------------------------------------------- AI early warning (govt) --
-ML_BACKEND = os.environ.get("SIH_ML_BACKEND", "http://127.0.0.1:8000")
+def _ml_backend_base():
+    raw = (os.environ.get("SIH_ML_BACKEND") or "http://127.0.0.1:8000").strip().rstrip("/")
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        # Render `fromService: host` may inject a bare hostname; production is HTTPS.
+        raw = "https://" + raw
+    return raw
+
+
+ML_BACKEND = _ml_backend_base()
 
 
 def _ml_post(path, payload):
@@ -2722,9 +2758,14 @@ def ivr_info_public():
     })
 
 if __name__ == "__main__":
-    init_db()
-    print("Database ready at", os.path.join(os.path.dirname(__file__), "animal_health.db"))
-    from ivr.config import get_ivr_config_summary
-    print("IVR Config:", get_ivr_config_summary())
-    print(f"Starting app on http://0.0.0.0:{PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=True)
+    # init_db() already ran at import; this block is the local dev server only.
+    try:
+        from ivr.config import get_ivr_config_summary
+        print("IVR Config:", get_ivr_config_summary())
+    except Exception:
+        pass
+    _debug_env = os.environ.get("FLASK_DEBUG", "")
+    # Preserve local default (debug on port 5001) but never debug in production.
+    DEBUG = (_debug_env.lower() in ("1", "true", "yes")) if _debug_env else (PORT == 5001)
+    print(f"Starting app on http://0.0.0.0:{PORT} (debug={DEBUG})")
+    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)

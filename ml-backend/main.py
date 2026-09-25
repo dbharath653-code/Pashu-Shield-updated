@@ -12,22 +12,30 @@ from sklearn.cluster import DBSCAN
 
 app = FastAPI(title="Livestock Health Surveillance AI & Decision Support API")
 
+# Production: restrict browser origins via CORS_ORIGINS env (comma-separated).
+# Default "*" preserves existing behaviour; credentialed requests require explicit origins.
+_CORS_ENV = os.environ.get("CORS_ORIGINS", "*").strip()
+_CORS_ORIGINS = [o.strip() for o in _CORS_ENV.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=("*" not in _CORS_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+
 # Load existing models safely
 def load_models():
     try:
-        rf_model = joblib.load("models/rf_model.pkl")
-        scaler = joblib.load("models/scaler.pkl")
-        iso_model = joblib.load("models/iso_model.pkl")
-        with open("models/metrics.json", "r") as f:
+        rf_model = joblib.load(os.path.join(MODELS_DIR, "rf_model.pkl"))
+        scaler = joblib.load(os.path.join(MODELS_DIR, "scaler.pkl"))
+        iso_model = joblib.load(os.path.join(MODELS_DIR, "iso_model.pkl"))
+        with open(os.path.join(MODELS_DIR, "metrics.json"), "r") as f:
             metrics = json.load(f)
+        print(f"ML models loaded from {MODELS_DIR}")
         return rf_model, scaler, iso_model, metrics
     except Exception as e:
         print(f"Error loading models: {e}")
@@ -56,6 +64,20 @@ class PredictRequest(BaseModel):
     animal_density: float
     previous_cases: float
     cases_growth_rate: float
+
+@app.get("/health")
+async def health():
+    loaded = rf_model is not None and scaler is not None and iso_model is not None
+    return {
+        "status": "ok" if loaded else "degraded",
+        "models_loaded": loaded,
+        "model_version": "v1.0",
+        "last_trained": (metrics or {}).get("last_trained"),
+    }
+
+@app.get("/api/health")
+async def api_health():
+    return await health()
 
 @app.post("/api/predict")
 async def predict_risk(req: PredictRequest):

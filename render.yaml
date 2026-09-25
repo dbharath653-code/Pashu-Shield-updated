@@ -1,3 +1,12 @@
+# Pashu-Shield production deployment (Render Blueprint).
+#
+# Architecture (single-origin, simplest reliable setup):
+#   USERS -> https://<backend-host> (Flask serves frontend + /api + IVR webhooks)
+#     -> https://<ml-host> (FastAPI, via SIH_ML_BACKEND, server-to-server)
+#   SQLite lives on a persistent disk so restarts/deploys keep data.
+#
+# Deploy: push this repo to GitHub -> Render Dashboard -> New -> Blueprint ->
+# select repo. Then set the `sync: false` secrets below in the dashboard.
 services:
   - type: web
     name: pashu-shield-backend
@@ -5,11 +14,22 @@ services:
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    healthCheckPath: /api/health
+    disk:
+      name: pashu-shield-data
+      mountPath: /var/data/pashu-shield
+      sizeGB: 1
     envVars:
       - key: SIH_SECRET_KEY
         generateValue: true
+      - key: SIH_DB_PATH
+        value: /var/data/pashu-shield/animal_health.db
       - key: SIH_ML_BACKEND
-        sync: false
+        fromService:
+          type: web
+          name: pashu-shield-ml
+          property: host
+        # NOTE: Render `host` yields "https://<ml-host>"; no trailing path needed.
       # IVR Reporting Channel - extension, not rewrite
       - key: TELEPHONY_PROVIDER
         value: mock
@@ -32,6 +52,9 @@ services:
         value: "true"
       - key: IVR_LOCATION_SMS_ENABLED
         value: "false"
+      - key: APP_BASE_URL
+        sync: false
+        # Set to https://<backend-host> so IVR SMS location links use the public URL.
 
   - type: web
     name: pashu-shield-ml
@@ -39,3 +62,7 @@ services:
     rootDir: ml-backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: CORS_ORIGINS
+        value: "*"

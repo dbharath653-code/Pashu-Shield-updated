@@ -40,6 +40,8 @@ https://<your-backend-host>/api/ivr/webhook/call
 https://<your-backend-host>/api/ivr/webhook/status   (status callback)
 ```
 
+(Legacy aliases `/api/ivr/webhook/incoming` and `/api/ivr/webhook/voice` serve the same handler.)
+
 - Must be HTTPS with valid certificate (provider requirement).
 - Example (Twilio): Console → Phone Numbers → Active Numbers → Select `IVR_PHONE_NUMBER` → Voice Configuration → Webhook `https://.../api/ivr/webhook/call` (POST), Status Callback `https://.../api/ivr/webhook/status`.
 - Example (Exotel): Exotel Dashboard → App Bazaar → IVR App → Connect → URL `https://.../api/ivr/webhook/call`.
