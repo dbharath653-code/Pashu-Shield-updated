@@ -135,13 +135,14 @@ window.addEventListener("online", syncOfflineQueue);
 
 async function api(path, { method = "GET", body } = {}) {
   const headers = { "Content-Type": "application/json" };
-  if (state.token) headers.Authorization = "Bearer " + state.token;
+  const tok = state.token || (function () { try { return localStorage.getItem("token"); } catch(e) { return null; } })();
+  if (tok) headers.Authorization = "Bearer " + tok;
   try {
     const res = await fetch(API + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
     let data = {};
     try { data = await res.json(); } catch (e) { /* no body */ }
     if (!res.ok) {
-      if (res.status === 401) logout(true);
+      if (res.status === 401 && path !== "/auth/login") logout(true);
       const err = new Error(data.error || "Something went wrong. Please try again.");
       err.data = data;
       err.status = res.status;
@@ -160,8 +161,10 @@ async function api(path, { method = "GET", body } = {}) {
 
 function setAuth(token, user) {
   state.token = token; state.user = user;
-  localStorage.setItem("token", token);
-  localStorage.setItem("user", JSON.stringify(user));
+  try {
+    localStorage.setItem("token", token);
+    localStorage.setItem("user", JSON.stringify(user));
+  } catch(e) {}
 }
 
 function logout(silent) {
@@ -402,6 +405,8 @@ function renderAuth(mode, role) {
     document.getElementById("loginForm").addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = Object.fromEntries(new FormData(e.target));
+      fd.identifier = (fd.identifier || "").trim();
+      fd.password = (fd.password || "").trim();
       try {
         const data = await api("/auth/login", { method: "POST", body: fd });
         if (data.user.role !== role) {
@@ -429,15 +434,26 @@ function renderAuth(mode, role) {
 }
 
 function loginForm(role) {
+  const demoEmail = role === "owner" ? "rajesh@example.com" : role === "vet" ? "vet1@example.com" : role === "lab" ? "lab@example.com" : "govt@example.com";
   return `
   <form id="loginForm">
-    <div class="field"><label>Email or Mobile</label><input name="identifier" required /></div>
-    <div class="field"><label>Password</label><input name="password" type="password" required /></div>
+    <div class="field"><label>Email or Mobile</label><input name="identifier" id="loginIdentifier" value="${demoEmail}" placeholder="${demoEmail}" autocapitalize="none" autocomplete="username" required /></div>
+    <div class="field"><label>Password</label><input name="password" id="loginPassword" type="password" value="password123" placeholder="password123" autocomplete="current-password" required /></div>
     <button class="btn btn-primary" type="submit">${t("btn.login")}</button>
     <div class="auth-switch">${t("auth.newHere")} <a onclick="location.hash='#/register/${role}'">${t("auth.createAccount")}</a></div>
-    <div class="demo-box"><b>Demo Account:</b> ${role === "owner" ? "rajesh@example.com" : role === "vet" ? "vet1@example.com" : role === "lab" ? "lab@example.com" : "govt@example.com"} / password123</div>
+    <div class="demo-box" style="cursor:pointer" onclick="fillDemoCredentials('${demoEmail}','password123')">
+      <b>💡 Demo Credentials:</b> Tap to fill <u>${demoEmail}</u> / <u>password123</u>
+    </div>
   </form>`;
 }
+
+window.fillDemoCredentials = function(email, pwd) {
+  const i = document.getElementById("loginIdentifier");
+  const p = document.getElementById("loginPassword");
+  if (i) i.value = email;
+  if (p) p.value = pwd;
+  toast("Demo credentials filled!");
+};
 
 function registerForm(role) {
   return `
