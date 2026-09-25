@@ -312,12 +312,15 @@ class TestHelpline(unittest.TestCase):
     def test_17_existing_assignment_preferred(self):
         from ivr.services.call_service import rank_vets_for_call
         conn = database.get_db()
+        # Temporarily close any existing active cases for owner with other vets so only vid has the active assignment
+        conn.execute("UPDATE cases SET status='CLOSED' WHERE owner_id=? AND vet_id!=0", (self.owner["id"],))
         conn.execute("INSERT INTO users (full_name, mobile, email, password_hash, salt, role, district, availability_status) VALUES (?,?,?,?,?,?,?,?)",
                      ("Pune Vet Two", "9800098002", "punevet2@example.com", "x", "y", "vet", "Pune", "AVAILABLE"))
         vid = conn.execute("SELECT id FROM users WHERE email='punevet2@example.com'").fetchone()["id"]
         animal = conn.execute("SELECT id FROM animals WHERE owner_id=? LIMIT 1", (self.owner["id"],)).fetchone()
         conn.execute("INSERT INTO cases (case_no, animal_id, owner_id, vet_id, symptoms, status) VALUES (?,?,?,?,?,?)",
                      ("CASE-HL-ASSIGN-1", animal["id"], self.owner["id"], vid, "test", "NEW"))
+        conn.commit()
         try:
             ranked = rank_vets_for_call(conn, "Pune", "en", self.owner["id"])
             self.assertEqual(ranked[0]["id"], vid)
@@ -325,6 +328,7 @@ class TestHelpline(unittest.TestCase):
         finally:
             conn.execute("DELETE FROM cases WHERE case_no='CASE-HL-ASSIGN-1'")
             conn.execute("DELETE FROM users WHERE id=?", (vid,))
+            conn.execute("UPDATE cases SET status='DIAGNOSED' WHERE case_no='CASE-000801'")
             conn.commit()
             conn.close()
 

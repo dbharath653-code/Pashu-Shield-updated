@@ -203,7 +203,9 @@ def check_allergy_conflict(medicine_name: str, active_allergies: list) -> dict |
 @app.after_request
 def no_cache_static(resp):
     if request.path in ("/", "/index.html") or request.path.endswith((".js", ".css")):
-        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
     # Optional CORS for split deployments (frontend hosted separately).
     # Same-origin (default: Flask serves frontend) needs nothing. Set
     # CORS_ORIGINS="https://app.example.com,https://other.example.com" to enable.
