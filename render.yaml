@@ -10,6 +10,28 @@ services:
         generateValue: true
       - key: SIH_ML_BACKEND
         sync: false
+      # IVR Reporting Channel - extension, not rewrite
+      - key: TELEPHONY_PROVIDER
+        value: mock
+        sync: false
+      - key: IVR_PHONE_NUMBER
+        sync: false
+      - key: TELEPHONY_ACCOUNT_ID
+        sync: false
+      - key: TELEPHONY_AUTH_TOKEN
+        sync: false
+      - key: TELEPHONY_WEBHOOK_SECRET
+        sync: false
+      - key: TELEPHONY_PHONE_NUMBER
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: IVR_RECORDING_ENABLED
+        value: "true"
+      - key: IVR_AI_ENABLED
+        value: "true"
+      - key: IVR_LOCATION_SMS_ENABLED
+        value: "false"
 
   - type: web
     name: pashu-shield-ml

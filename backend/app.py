@@ -22,6 +22,16 @@ from database import (
 )
 import weather
 import animal_ai
+import secrets as _secrets_for_ivr
+
+# IVR integration - production-grade IVR reporting channel
+try:
+    from ivr.routes import register_ivr_routes
+    from ivr.config import IVR_PHONE_NUMBER, TELEPHONY_PROVIDER
+    HAS_IVR = True
+except Exception as e:
+    print(f"IVR module not loaded: {e}")
+    HAS_IVR = False
 
 SECRET_KEY = os.environ.get("SIH_SECRET_KEY", "sih-hackathon-dev-secret-change-me")
 TOKEN_EXP_HOURS = 12
@@ -2683,8 +2693,38 @@ def sync_queue():
     return jsonify({"synced_count": len([r for r in results if r["status"] == "success"]), "results": results})
 
 
+# Register IVR routes (adds /api/ivr/* endpoints without breaking existing APIs)
+if HAS_IVR:
+    try:
+        register_ivr_routes(app)
+        print(f"✓ IVR system registered (provider={TELEPHONY_PROVIDER}, number={IVR_PHONE_NUMBER or 'NOT_CONFIGURED'})")
+    except Exception as e:
+        print(f"✗ Failed to register IVR routes: {e}")
+        import traceback; traceback.print_exc()
+
+# Ensure all existing /api cases include IVR source visibility (already via reported_through field)
+@app.get("/api/health")
+def health():
+    return jsonify({"status": "ok", "ivr": HAS_IVR, "version": "1.0"})
+
+@app.get("/api/ivr/info")
+def ivr_info_public():
+    if not HAS_IVR:
+        return jsonify({"ivr": False})
+    from ivr.config import get_ivr_config_summary, validate_required_config, is_provider_configured
+    return jsonify({
+        "ivr": True,
+        "config": get_ivr_config_summary(),
+        "missing_env": validate_required_config(),
+        "provider_ready": is_provider_configured(),
+        "reporting_channels": ["WEB", "MOBILE", "IVR"],
+        "note": "IVR is an additional reporting channel; web reporting continues unchanged."
+    })
+
 if __name__ == "__main__":
     init_db()
     print("Database ready at", os.path.join(os.path.dirname(__file__), "animal_health.db"))
+    from ivr.config import get_ivr_config_summary
+    print("IVR Config:", get_ivr_config_summary())
     print(f"Starting app on http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=True)
