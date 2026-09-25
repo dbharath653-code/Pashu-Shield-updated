@@ -2704,3 +2704,360 @@ window.deleteCase = async function (id, caseNo) {
   try { await api(`/cases/${id}`, { method: "DELETE" }); toast(`Report ${caseNo} deleted`); location.hash = "#/vet/reports"; }
   catch (err) { toast(err.message, true); }
 };
+
+// ======================================================== IVR REPORTING SYSTEM (PRODUCTION-GRADE) ==
+// Minimal UI extensions for IVR - preserves existing design system
+
+function ivrStatusBadge(status) {
+  const s = (status||"").toUpperCase();
+  if (["RECEIVED","AI_SUMMARIZED","VET_NOTIFIED"].includes(s)) return "badge-blue";
+  if (["PARTIALLY_COMPLETED","DUPLICATE_FLAGGED"].includes(s)) return "badge-orange";
+  if (["HIGH","CRITICAL"].includes(s)) return "badge-red";
+  return statusBadgeClass(s);
+}
+function urgencyBadge(urg) {
+  const u=(urg||"").toUpperCase();
+  if (u==="CRITICAL") return "badge-red";
+  if (u==="HIGH") return "badge-red";
+  if (u==="MEDIUM") return "badge-orange";
+  return "badge-green";
+}
+
+// Inject IVR quick-action cards into existing dashboards (non-destructive)
+const _origGovtDashboard = govtDashboard;
+govtDashboard = async function() {
+  await _origGovtDashboard();
+  // Append IVR section after existing content without redesign
+  const appEl = document.getElementById("app");
+  if (!appEl || document.getElementById("ivr-govt-extra")) return;
+  const extra = document.createElement("div");
+  extra.id = "ivr-govt-extra";
+  extra.innerHTML = `
+    <div class="section-card">
+      <div class="section-title">📞 IVR Reporting Channel</div>
+      <div class="meta" style="margin-bottom:12px"> Farmer phone-based reporting: multilingual IVR (English/Telugu/Hindi/Marathi), DTMF+speech, auto-report generation, vet bridging, and government surveillance integration.</div>
+      <div class="icon-grid">
+        ${iconItem("📞", "IVR Reports", "#/govt/ivr-reports")}
+        ${iconItem("📊", "IVR Analytics", "#/govt/ivr-analytics")}
+        ${iconItem("📋", "Call History", "#/govt/ivr-calls")}
+        ${iconItem("⚙️", "IVR Config", "#/govt/ivr-config")}
+      </div>
+    </div>`;
+  // Insert before bottomNav
+  const bnav = appEl.querySelector(".bottom-nav");
+  if (bnav) appEl.insertBefore(extra, bnav);
+  else appEl.appendChild(extra);
+};
+
+const _origVetDashboard = vetDashboard;
+vetDashboard = async function() {
+  await _origVetDashboard();
+  const appEl = document.getElementById("app");
+  if (!appEl || document.getElementById("ivr-vet-extra")) return;
+  const extra = document.createElement("div");
+  extra.id = "ivr-vet-extra";
+  extra.innerHTML = `
+    <div class="section-card">
+      <div class="section-title">📞 IVR Farmer Reports</div>
+      <div class="meta" style="margin-bottom:12px">Phone-based reports appear as normal cases with source=IVR. Language, location (farmer-provided/GPS), and AI summary are preserved for veterinary review.</div>
+      <div class="icon-grid">
+        ${iconItem("📞", "IVR Reports", "#/vet/ivr-reports")}
+        ${iconItem("📋", "Call History", "#/vet/ivr-calls")}
+        ${iconItem("🧠", "AI Summary", "#/govt/ivr-analytics")}
+      </div>
+    </div>`;
+  const bnav = appEl.querySelector(".bottom-nav");
+  if (bnav) appEl.insertBefore(extra, bnav);
+  else appEl.appendChild(extra);
+};
+
+const _origOwnerDashboard = ownerDashboard;
+ownerDashboard = async function() {
+  await _origOwnerDashboard();
+  const appEl = document.getElementById("app");
+  if (!appEl || document.getElementById("ivr-owner-extra")) return;
+  try {
+    const ivrInfo = await api("/ivr/info").catch(()=>null);
+    const ivrNum = ivrInfo && ivrInfo.config ? ivrInfo.config.ivr_phone_number : "Not configured";
+    const extra = document.createElement("div");
+    extra.id = "ivr-owner-extra";
+    extra.innerHTML = `
+      <div class="section-card">
+        <div class="section-title">📞 IVR Helpline</div>
+        <div class="meta">You can also report animal health issues by calling the PashuMitra IVR helpline. No smartphone required.</div>
+        <div style="margin-top:10px;background:#e7effe;border-radius:12px;padding:12px;text-align:center">
+          <div style="font-size:13px;color:var(--muted)">IVR Phone Number</div>
+          <div style="font-size:18px;font-weight:800;color:var(--primary)">${ivrNum}</div>
+          <div class="small-muted" style="margin-top:4px">Multilingual: English · Telugu · Hindi · Marathi · Press 9 to repeat, 0 to go back</div>
+        </div>
+        <div class="btn-row" style="margin-top:12px">
+          <button class="btn btn-ghost btn-sm" onclick="location.hash='#/owner/ivr-reports'">View My IVR Reports</button>
+        </div>
+      </div>`;
+    const bnav = appEl.querySelector(".bottom-nav");
+    if (bnav) appEl.insertBefore(extra, bnav);
+    else appEl.appendChild(extra);
+  } catch(e) {}
+};
+
+// ---------------- IVR Reports List ----------------
+function ivrReportsView(role) {
+  route(`#/${role}/ivr-reports`, async () => {
+    render(`${header("IVR Reports", {back:true})}<div class="loading">Loading IVR reports…</div>`);
+    const reports = await api("/ivr/reports");
+    render(`
+      ${header("IVR Reports — " + role, {back:true})}
+      <div class="section-card">
+        <div class="section-title">📞 IVR Reports (${reports.length}) — Source: Phone Call</div>
+        <div class="meta" style="margin-bottom:12px">Each report was auto-generated from an IVR phone survey and linked to a normal veterinary case. Urgency is rule-based + AI-assisted, never overriding veterinarian judgment.</div>
+        ${reports.length===0 ? emptyState("No IVR reports yet. Farmer calls will appear here automatically.") : reports.map(r=>`
+          <div class="list-card" onclick="location.hash='#/${role}/ivr-reports/${r.id}'">
+            <div class="row1">
+              <span class="title">${r.report_no} <span class="small-muted">via ${r.language||'en'}</span></span>
+              <span class="badge ${urgencyBadge(r.urgency)}">${r.urgency||'MEDIUM'}</span>
+            </div>
+            <div class="meta"><b>Caller:</b> ${r.caller_number ? r.caller_number.slice(0,3)+'****'+r.caller_number.slice(-4) : 'Unknown'} · <b>Animal:</b> ${r.animal_species||'—'} x${r.animal_count||1} · <b>Status:</b> <span class="badge ${ivrStatusBadge(r.status)}">${r.status||'RECEIVED'}</span></div>
+            <div class="meta"><b>Location:</b> ${r.location_village||'—'}, ${r.location_district||'—'} (${r.location_source||'FARMER_PROVIDED'}) · ${fmtDate(r.created_at)}</div>
+            <div class="meta"><b>Problem:</b> ${r.main_problem||'—'} · <b>Severity:</b> ${r.severity||'—'} · ${r.symptoms? r.symptoms.slice(0,80):''}</div>
+            ${r.is_duplicate ? `<div style="margin-top:4px"><span class="badge badge-orange">Possible duplicate</span></div>` : ``}
+            ${r.case_id ? `<div class="small-muted" style="margin-top:4px">Linked case: ${r.case_id} → Tap to review</div>` : ``}
+          </div>
+        `).join("")}
+      </div>
+      ${role==="govt" ? `<div class="section-card"><button class="btn btn-ghost btn-sm" onclick="location.hash='#/govt/ivr-analytics'">View IVR Analytics</button></div>` : ``}
+      ${bottomNav(`#/${role}/ivr-reports`)}
+    `);
+  }, [role]);
+}
+ivrReportsView("owner"); ivrReportsView("vet"); ivrReportsView("govt");
+
+// ---------------- IVR Report Detail ----------------
+function ivrReportDetailView(role) {
+  route(`#/${role}/ivr-reports/:id`, async ({id}) => {
+    render(`${header("IVR Report", {back:true})}<div class="loading">Loading report…</div>`);
+    const r = await api(`/ivr/reports/${id}`);
+    const s = r.ai_structured || {};
+    render(`
+      ${header(r.report_no, {back:true})}
+      <div class="section-card">
+        <div class="row1" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span class="badge ${urgencyBadge(r.urgency)}">${r.urgency} priority</span>
+          <span class="badge ${ivrStatusBadge(r.status)}">${r.status}</span>
+        </div>
+        <div class="detail-grid">
+          <div><b>Call ID</b>${r.call_sid||'—'}</div>
+          <div><b>Language</b>${r.language||'—'}</div>
+          <div><b>Caller</b>${r.caller_number||'—'}</div>
+          <div><b>Reported</b>${fmtDate(r.created_at)}</div>
+          <div><b>Animal Species</b>${r.animal_species||'—'}</div>
+          <div><b>Breed</b>${r.animal_breed||'—'}</div>
+          <div><b>Age</b>${r.animal_age||'—'}</div>
+          <div><b>Sex</b>${r.animal_sex||'—'}</div>
+          <div><b>Count Affected</b>${r.animal_count||1}</div>
+          <div><b>Pregnant</b>${r.is_pregnant||'—'}</div>
+          <div><b>Main Problem</b>${r.main_problem||'—'}</div>
+          <div><b>Severity</b>${r.severity||'—'}</div>
+          <div><b>Duration</b>${r.duration||'—'} days</div>
+          <div><b>Eating</b>${r.eating_status||'—'}</div>
+          <div><b>Drinking</b>${r.drinking_status||'—'}</div>
+          <div><b>Temperature</b>${r.temperature||'—'}</div>
+          <div><b>Vaccination</b>${r.vaccination_status||'—'}</div>
+          <div><b>Location Village</b>${r.location_village||'—'}</div>
+          <div><b>District</b>${r.location_district||'—'}</div>
+          <div><b>State</b>${r.location_state||'—'}</div>
+          <div><b>Location Source</b>${r.location_source||'NOT_AVAILABLE'}</div>
+          <div><b>Accuracy</b>${r.location_accuracy||'—'}</div>
+          ${r.location_lat ? `<div><b>GPS Lat</b>${r.location_lat}</div><div><b>GPS Lng</b>${r.location_lng}</div>` : ``}
+        </div>
+        ${r.symptoms ? `<div style="margin-top:10px"><b class="small-muted">Symptoms:</b><div style="font-size:13px">${r.symptoms}</div></div>` : ``}
+        ${r.additional_description && r.additional_description!=="Not provided" ? `<div style="margin-top:8px"><b class="small-muted">Additional:</b><div style="font-size:13px">${r.additional_description}</div></div>` : ``}
+        ${r.is_duplicate ? `<div class="conflict-box" style="margin-top:10px"><b>⚠️ Possible duplicate of report #${r.duplicate_of_report_id}</b><div>Same caller + species + problem within 24h. Verify before creating duplicate case actions.</div></div>` : ``}
+      </div>
+
+      <div class="section-card">
+        <div class="subheading">🧠 AI-Generated Summary — veterinarian verification required</div>
+        <div style="background:#fff8e1;border-left:4px solid #ffb300;padding:12px;border-radius:8px;font-size:13px;white-space:pre-wrap">${r.ai_summary||'No summary available'}</div>
+        ${s && s.animal ? `<div class="detail-grid" style="margin-top:10px">
+          <div><b>AI Urgency</b>${s.urgency||'—'}</div>
+          <div><b>Follow-up Required</b>${s.follow_up_required ? 'Yes' : 'No'}</div>
+        </div>` : ``}
+        <div class="small-muted" style="margin-top:6px">Structured JSON validated before storage. Missing fields are “Not provided”, never hallucinated.</div>
+      </div>
+
+      ${r.transcript_full ? `<div class="section-card"><div class="subheading">🗣️ Transcript (where permitted)</div><div style="font-size:13px;white-space:pre-wrap;background:#f8f9fe;padding:12px;border-radius:12px">${r.transcript_full.slice(0,2000)}</div></div>` : ``}
+
+      ${r.case_id ? `<div class="section-card">
+        <div class="subheading">🔗 Linked Veterinary Case</div>
+        <div class="meta">This IVR report auto-created case <b>${r.case_id}</b> in the existing case system. It is visible to vets and government dashboards as a normal report with source=IVR.</div>
+        <button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="location.hash='#/${role}/cases/${r.case_id}'">Open Linked Case</button>
+      </div>` : ``}
+
+      <div class="section-card">
+        <div class="subheading">⚙️ Report Lifecycle</div>
+        <div class="meta" style="margin-bottom:8px">Status flow: RECEIVED → AI_SUMMARIZED → VET_NOTIFIED → UNDER_REVIEW → VET_CONTACTED → ACTION_RECOMMENDED → FOLLOW_UP → RESOLVED → CLOSED</div>
+        ${role!=="owner" ? `
+          <div class="field"><label>Update Status</label><select id="ivrStatusSel">
+            ${["RECEIVED","AI_SUMMARIZED","VET_NOTIFIED","UNDER_REVIEW","VET_CONTACTED","ACTION_RECOMMENDED","FOLLOW_UP","RESOLVED","CLOSED","DUPLICATE_FLAGGED"].map(st=>`<option ${st===r.status?"selected":""}>${st}</option>`).join("")}
+          </select></div>
+          <div class="field"><label>Note (optional)</label><input id="ivrStatusNote" placeholder="e.g. Vet contacted farmer, prescribed ORS" /></div>
+          <button class="btn btn-primary btn-sm" onclick="updateIvrStatus(${r.id}, document.getElementById('ivrStatusSel').value, document.getElementById('ivrStatusNote').value)">Update Status</button>
+        ` : `<div class="small-muted">Status: <b>${r.status}</b> — a veterinarian will update the case as they review it.</div>`}
+      </div>
+      ${bottomNav(`#/${role}/ivr-reports`)}
+    `);
+  }, [role]);
+}
+ivrReportDetailView("owner"); ivrReportDetailView("vet"); ivrReportDetailView("govt");
+window.updateIvrStatus = async function(id, status, note) {
+  try { await api(`/ivr/reports/${id}/status`, {method:"PUT", body:{status, note}}); toast("IVR report status updated"); router(); }
+  catch(e){ toast(e.message,true); }
+};
+
+// ---------------- IVR Call History ----------------
+function ivrCallsView(role) {
+  route(`#/${role}/ivr-calls`, async () => {
+    render(`${header("IVR Call History", {back:true})}<div class="loading">Loading call history…</div>`);
+    const calls = await api("/ivr/calls");
+    const reports = await api("/ivr/reports").catch(()=>[]);
+    const reportByCall = Object.fromEntries(reports.map(r=>[r.call_sid, r]));
+    render(`
+      ${header("IVR Call History", {back:true})}
+      <div class="section-card">
+        <div class="section-title">📋 IVR Calls (${calls.length})</div>
+        <div class="meta" style="margin-bottom:12px">Every call’s caller ID, language, menu choice, vet connection, survey progress, and resulting report are traceable. Partial disconnects are preserved as PARTIALLY_COMPLETED.</div>
+        ${calls.length===0 ? emptyState("No IVR calls yet.") : calls.map(c=> {
+          const rep = reportByCall[c.call_sid];
+          return `<div class="list-card" onclick="location.hash='#/${role}/ivr-calls/${c.call_sid}'">
+            <div class="row1"><span class="title">${c.call_sid}</span><span class="badge ${statusBadgeClass(c.status)}">${c.status}</span></div>
+            <div class="meta"><b>Caller:</b> ${c.caller_number_normalized ? c.caller_number_normalized.slice(0,3)+'****'+c.caller_number_normalized.slice(-4) : 'Hidden/Unknown'} → <b>IVR:</b> ${c.ivr_phone_number||'—'} · <b>Lang:</b> ${c.language||'—'} · ${fmtDate(c.created_at)} · ${c.duration_seconds||0}s</div>
+            <div class="meta"><b>Report:</b> ${rep ? rep.report_no + ' (' + rep.urgency + ')' : 'No report yet (abandoned/failed)'}${c.is_mock ? ' · <span class="small-muted">Mock call</span>' : ''}</div>
+          </div>`;
+        }).join("")}
+      </div>
+      ${bottomNav(`#/${role}/ivr-calls`)}
+    `);
+  }, [role]);
+}
+ivrCallsView("vet"); ivrCallsView("govt");
+
+route("#/vet/ivr-calls/:sid", async ({sid}) => {
+  render(`${header("Call Detail", {back:true})}<div class="loading">Loading…</div>`);
+  const data = await api(`/ivr/calls/${sid}`);
+  const c=data.call, s=data.session, responses=data.responses||[], events=data.events||[];
+  render(`
+    ${header("Call " + c.call_sid.slice(0,12), {back:true})}
+    <div class="section-card">
+      <div class="row1" style="justify-content:space-between;display:flex;align-items:center;margin-bottom:8px">
+        <span class="badge ${statusBadgeClass(c.status)}">${c.status}</span>
+        <span class="badge badge-blue">${c.language||'en'}</span>
+      </div>
+      <div class="detail-grid">
+        <div><b>Caller ID</b>${c.caller_number_normalized||c.caller_number||'Hidden'}</div>
+        <div><b>IVR Number</b>${c.ivr_phone_number||'—'}</div>
+        <div><b>Provider</b>${c.provider||'—'}</div>
+        <div><b>Duration</b>${c.duration_seconds||0}s</div>
+        <div><b>Recording</b>${c.recording_enabled ? 'Enabled' : 'Disabled'} ${c.recording_consent ? '(consent obtained)' : ''}</div>
+        <div><b>Current State</b>${s ? s.current_state : '—'}</div>
+      </div>
+    </div>
+    <div class="section-card">
+      <div class="subheading">📝 Survey Responses (${responses.length})</div>
+      ${responses.length===0 ? emptyState("No survey responses captured.") : responses.map(r=>`
+        <div class="list-card" style="cursor:default">
+          <div class="row1"><span class="title">${r.question_key}</span><span class="badge badge-blue">${r.answer_source}</span></div>
+          <div class="meta"><b>Q:</b> ${r.question_text||''}</div>
+          <div class="meta"><b>A:</b> ${r.answer_normalized||'Not provided'} <span class="small-muted"> (raw: ${r.answer_raw||''})</span></div>
+        </div>
+      `).join("")}
+    </div>
+    <div class="section-card">
+      <div class="subheading">🕒 Call Events (audit trail)</div>
+      <div class="timeline">${events.map(e=>`
+        <div class="timeline-item"><div class="timeline-dot"></div><div class="timeline-body"><div class="t-status">${e.event_type}</div><div class="t-note">${e.details||''} ${e.from_state ? `(${e.from_state} → ${e.to_state})` : ''}</div><div class="t-date">${fmtDate(e.created_at)}</div></div></div>
+      `).join("")}</div>
+    </div>
+    ${data.report ? `<div class="section-card"><button class="btn btn-primary btn-sm" onclick="location.hash='#/vet/ivr-reports/${data.report.id}'">View Generated Report</button></div>` : ``}
+    ${bottomNav("#/vet/ivr-calls")}
+  `);
+}, ["vet","govt"]);
+
+// ---------------- IVR Analytics ----------------
+route("#/govt/ivr-analytics", async () => {
+  render(`${header("IVR Analytics", {back:true})}<div class="loading">Loading IVR analytics…</div>`);
+  const a = await api("/ivr/analytics");
+  render(`
+    ${header("IVR Analytics", {back:true})}
+    <div class="section-card">
+      <div class="section-title">📊 IVR Performance — Live Database</div>
+      <div class="stat-grid" style="margin:0">
+        ${statCard(a.total_calls||0, "Total Calls")}
+        ${statCard(a.reports_generated||0, "Reports Generated")}
+        ${statCard(a.vet_connections||0, "Vet Connected")}
+        ${statCard(a.high_priority||0, "High Priority")}
+        ${statCard(a.vet_unavailable||0, "Vet Unavailable")}
+        ${statCard(Math.round(a.avg_call_duration||0)+"s", "Avg Duration")}
+      </div>
+    </div>
+    <div class="section-card">
+      <div class="section-title">📈 Reports by District</div>
+      ${barChart(a.by_district)}
+    </div>
+    <div class="section-card">
+      <div class="section-title">🥧 Reports by Problem Category</div>
+      ${pieChart(a.by_problem)}
+    </div>
+    <div class="section-card">
+      <div class="section-title">📋 Call Outcomes</div>
+      <div class="stat-grid" style="margin:0">
+        ${statCard(a.completed_calls||0, "Completed")}
+        ${statCard(a.partial_reports||0, "Partial/Abandoned")}
+        ${statCard(a.failed_calls||0, "Failed")}
+      </div>
+    </div>
+    ${a.daily && a.daily.length ? `<div class="section-card"><div class="section-title">📅 Daily Trend (last 7 days)</div><div class="table-wrap"><table class="data-table"><thead><tr><th>Date</th><th>Calls</th><th>Reports</th><th>High Pri</th></tr></thead><tbody>${a.daily.map(d=>`<tr><td>${d.date}</td><td>${d.total_calls}</td><td>${d.reports_generated}</td><td>${d.high_priority_reports}</td></tr>`).join("")}</tbody></table></div></div>` : ``}
+    ${bottomNav("#/govt/ivr-analytics")}
+  `);
+}, ["govt","vet"]);
+
+route("#/vet/ivr-analytics", async () => { location.hash="#/govt/ivr-analytics"; }, ["vet"]);
+
+// ---------------- IVR Config (govt only) ----------------
+route("#/govt/ivr-config", async () => {
+  render(`${header("IVR Configuration", {back:true})}<div class="loading">Loading config…</div>`);
+  const cfg = await api("/ivr/config");
+  const tel = cfg.telephony || {};
+  render(`
+    ${header("IVR Configuration", {back:true})}
+    <div class="section-card">
+      <div class="section-title">⚙️ Telephony & IVR Settings</div>
+      <div class="meta" style="margin-bottom:12px">Provider credentials are environment variables (never hard-coded). Phone number is IVR_PHONE_NUMBER. Survey questions are configurable without redeploy.</div>
+      <div class="detail-grid">
+        <div><b>IVR Phone</b>${tel.ivr_phone_number||'NOT_CONFIGURED'}</div>
+        <div><b>Provider</b>${tel.telephony_provider||'mock'}</div>
+        <div><b>Recording</b>${tel.recording_enabled ? 'Enabled' : 'Disabled'}</div>
+        <div><b>AI Enabled</b>${tel.ai_enabled ? 'Yes' : 'No'}</div>
+        <div><b>STT Provider</b>${tel.stt_provider||'whisper'}</div>
+        <div><b>Languages</b>${(tel.supported_languages||[]).join(", ")}</div>
+        <div><b>Provider Ready</b>${tel.provider_configured ? 'Yes' : 'Mock/dev'}</div>
+        <div><b>Async</b>${tel.async_enabled ? 'Yes' : 'No'}</div>
+      </div>
+      ${tel.ivr_phone_number==="NOT_CONFIGURED" ? `<div class="conflict-box" style="margin-top:12px"><b>⚠️ Production requires IVR_PHONE_NUMBER</b><div>Set IVR_PHONE_NUMBER, TELEPHONY_PROVIDER, TELEPHONY_ACCOUNT_ID, TELEPHONY_AUTH_TOKEN, TELEPHONY_PHONE_NUMBER as environment variables. Current provider is mock (dev). See deployment docs.</div></div>` : ``}
+    </div>
+    <div class="section-card">
+      <div class="subheading">📝 Survey Questions (configurable)</div>
+      <div class="meta" style="margin-bottom:8px">Questions are multilingual and support DTMF+speech with 9=repeat, 0=back, #=skip. Pregnancy questions are conditional on species.</div>
+      <div style="max-height:240px;overflow-y:auto;background:#f8f9fe;padding:10px;border-radius:12px;font-size:12px">
+        <pre style="white-space:pre-wrap;margin:0">${JSON.stringify(cfg.survey, null, 2).slice(0,3000)}</pre>
+      </div>
+      <div class="small-muted" style="margin-top:8px">To modify, use PUT /api/ivr/config (govt only) with updated JSON.</div>
+    </div>
+    <div class="section-card">
+      <div class="section-title">🔒 Security & Compliance</div>
+      <div class="meta">• Webhook signature verification (Twilio/Exotel HMAC) · Rate limiting · Input validation · Audit logging · Idempotency · Role-based access · PII masking · Call recording consent disclosure · Location source accuracy labeling (never fake GPS)</div>
+    </div>
+    ${bottomNav("#/govt/ivr-config")}
+  `);
+}, ["govt"]);
+
+// Owner IVR reports are via ivrReportsView("owner") already registered above
+

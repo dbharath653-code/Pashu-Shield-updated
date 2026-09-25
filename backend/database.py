@@ -455,10 +455,12 @@ CREATE INDEX IF NOT EXISTS idx_weather_dist ON weather_observations(district, fe
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -517,6 +519,22 @@ def calculate_expected_delivery(species: str, breeding_date_str: str) -> str:
     return str(b_date + timedelta(days=days))
 
 
+def init_ivr_schema(conn):
+    """Initialize IVR extension tables and default configs."""
+    try:
+        from ivr.schema import IVR_SCHEMA, DEFAULT_SURVEY_CONFIG_JSON
+        conn.executescript(IVR_SCHEMA)
+        # Insert default survey config if empty
+        has_cfg = conn.execute("SELECT COUNT(*) c FROM ivr_survey_config WHERE config_key='survey_definition'").fetchone()["c"]
+        if not has_cfg:
+            conn.execute(
+                "INSERT INTO ivr_survey_config (config_key, config_value, description) VALUES ('survey_definition', ?, 'Default IVR survey question definition')",
+                (DEFAULT_SURVEY_CONFIG_JSON,)
+            )
+        conn.commit()
+    except Exception as e:
+        print(f"init_ivr_schema warning: {e}")
+
 def init_db(reset=False):
     if reset and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
@@ -535,6 +553,8 @@ def init_db(reset=False):
     ensure_qr_for_existing_animals(conn)
     ensure_extended_seeds(conn)
     conn.commit()
+    # IVR schema (always ensure, even if not first_time, for upgrades)
+    init_ivr_schema(conn)
     conn.close()
 
 
