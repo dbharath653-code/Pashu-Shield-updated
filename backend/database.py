@@ -2,12 +2,25 @@
 Database layer for the SIH Animal Disease Management platform.
 Uses plain sqlite3 (stdlib) - no ORM required, keeps the hackathon
 prototype dependency-free and easy to run.
+Extended with end-to-end support for:
+- QR-based Animal & Sample Identity
+- Pregnancy & Reproductive Health
+- Medication & Allergy Profiles
+- Digital Sample Lifecycle & Chain of Custody
+- Laboratory Staff & Testing Workflow
+- Structured Treatment Responses
+- Farm & National Disease Intelligence
+- Real Weather Observations
+- Individual Animal AI Decision Support Assessments
+- Audit Events & Offline Synchronization
 """
 import sqlite3
 import os
 import secrets
 import hashlib
-from datetime import datetime, date
+import json
+import uuid
+from datetime import datetime, date, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "animal_health.db")
 
@@ -19,7 +32,7 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     salt TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('owner','vet','govt')),
+    role TEXT NOT NULL CHECK(role IN ('owner','vet','govt','lab')),
     specialization TEXT,
     village TEXT,
     block TEXT,
@@ -34,6 +47,7 @@ CREATE TABLE IF NOT EXISTS herds (
     herd_code TEXT UNIQUE NOT NULL,
     owner_id INTEGER NOT NULL REFERENCES users(id),
     village TEXT, block TEXT, district TEXT,
+    state TEXT DEFAULT 'Maharashtra',
     is_seed INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -54,6 +68,7 @@ CREATE TABLE IF NOT EXISTS animals (
     owner_name TEXT,
     mobile TEXT,
     village TEXT, block TEXT, district TEXT,
+    state TEXT DEFAULT 'Maharashtra',
     status TEXT DEFAULT 'Healthy',
     is_seed INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
@@ -74,6 +89,7 @@ CREATE TABLE IF NOT EXISTS cases (
     status TEXT DEFAULT 'NEW',
     diagnosis TEXT,
     treatment TEXT,
+    farm_alert_id INTEGER,
     is_seed INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
@@ -111,8 +127,23 @@ CREATE TABLE IF NOT EXISTS lab_reports (
     animal_id INTEGER NOT NULL REFERENCES animals(id),
     herd_id INTEGER REFERENCES herds(id),
     sample TEXT,
+    sample_id INTEGER REFERENCES samples(id),
     test_name TEXT,
+    test_type TEXT,
+    test_method TEXT,
     result TEXT,
+    quantitative_result REAL,
+    units TEXT,
+    reference_range_min REAL,
+    reference_range_max REAL,
+    reference_range_text TEXT,
+    abnormal_flag TEXT DEFAULT 'Normal',
+    technician_name TEXT,
+    verification_status TEXT DEFAULT 'UNVERIFIED',
+    verified_by INTEGER REFERENCES users(id),
+    verified_at TEXT,
+    comments TEXT,
+    published_at TEXT,
     test_date TEXT,
     notes TEXT,
     entered_by INTEGER REFERENCES users(id),
@@ -132,6 +163,8 @@ CREATE TABLE IF NOT EXISTS prescriptions (
     duration TEXT,
     instructions TEXT,
     follow_up_date TEXT,
+    allergy_override INTEGER DEFAULT 0,
+    override_reason TEXT,
     vet_id INTEGER REFERENCES users(id),
     is_seed INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now'))
@@ -197,6 +230,227 @@ CREATE TABLE IF NOT EXISTS case_visits (
     completed_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- ==================== NEW EXTENDED ENTITIES ====================
+
+CREATE TABLE IF NOT EXISTS animal_qr_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    animal_id INTEGER NOT NULL UNIQUE REFERENCES animals(id) ON DELETE CASCADE,
+    qr_token TEXT NOT NULL UNIQUE,
+    qr_payload TEXT NOT NULL,
+    status TEXT DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','REVOKED')),
+    created_at TEXT DEFAULT (datetime('now')),
+    revoked_at TEXT,
+    revoked_by INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS animal_reproductive_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
+    pregnancy_status TEXT NOT NULL DEFAULT 'Not Pregnant' CHECK(pregnancy_status IN ('Not Pregnant','Suspected','Confirmed Pregnant','Lactating','Dry','Miscarried/Aborted')),
+    breeding_date TEXT,
+    mating_service_date TEXT,
+    expected_delivery_date TEXT,
+    pregnancy_confirmation_date TEXT,
+    previous_pregnancies INTEGER DEFAULT 0,
+    offspring_count INTEGER DEFAULT 0,
+    event_type TEXT CHECK(event_type IN ('AI','Natural Service','Heat/Estrus','Pregnancy Check','Calving','Abortion','Other')),
+    miscarriage_abortion_notes TEXT,
+    breeding_notes TEXT,
+    recorded_by INTEGER REFERENCES users(id),
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS animal_allergies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
+    allergen TEXT NOT NULL,
+    allergy_severity TEXT NOT NULL DEFAULT 'Moderate' CHECK(allergy_severity IN ('Mild','Moderate','Severe','Life-Threatening')),
+    reaction TEXT NOT NULL,
+    date_recorded TEXT DEFAULT (date('now')),
+    recorded_by INTEGER REFERENCES users(id),
+    status TEXT DEFAULT 'Active' CHECK(status IN ('Active','Inactive')),
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS animal_medications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
+    case_id INTEGER REFERENCES cases(id),
+    prescription_id INTEGER REFERENCES prescriptions(id),
+    medication_name TEXT NOT NULL,
+    dosage TEXT,
+    frequency TEXT,
+    start_date TEXT,
+    end_date TEXT,
+    status TEXT DEFAULT 'Active' CHECK(status IN ('Active','Completed','Discontinued')),
+    prescribed_by INTEGER REFERENCES users(id),
+    allergy_override INTEGER DEFAULT 0,
+    override_reason TEXT,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_code TEXT UNIQUE NOT NULL,
+    qr_token TEXT NOT NULL UNIQUE,
+    qr_payload TEXT NOT NULL,
+    animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
+    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    lab_request_id INTEGER REFERENCES lab_requests(id),
+    sample_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'COLLECTED' CHECK(status IN ('COLLECTED','READY_FOR_PICKUP','PICKED_UP','IN_TRANSIT','ARRIVED_AT_LAB','LAB_RECEIVED','TESTING','RESULT_READY','COMPLETED','REJECTED')),
+    collector_id INTEGER REFERENCES users(id),
+    collection_lat REAL,
+    collection_lng REAL,
+    is_manual_location INTEGER DEFAULT 0,
+    collection_notes TEXT,
+    transporter_name TEXT,
+    transporter_phone TEXT,
+    rejection_reason TEXT,
+    collected_at TEXT DEFAULT (datetime('now')),
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sample_custody_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor_id INTEGER REFERENCES users(id),
+    actor_name TEXT,
+    actor_role TEXT,
+    lat REAL,
+    lng REAL,
+    is_manual_location INTEGER DEFAULT 0,
+    notes TEXT,
+    timestamp TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS treatment_responses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
+    prescription_id INTEGER REFERENCES prescriptions(id),
+    response TEXT NOT NULL CHECK(response IN ('improved','unchanged','worsened','recovered','adverse_reaction','treatment_discontinued','follow_up_required')),
+    response_date TEXT DEFAULT (date('now')),
+    veterinarian_id INTEGER REFERENCES users(id),
+    veterinarian_name TEXT,
+    objective_observations TEXT,
+    notes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS farm_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    herd_id INTEGER REFERENCES herds(id) ON DELETE CASCADE,
+    herd_code TEXT NOT NULL,
+    district TEXT NOT NULL,
+    state TEXT DEFAULT 'Maharashtra',
+    disease TEXT NOT NULL,
+    affected_animals_count INTEGER DEFAULT 0,
+    affected_animals_codes TEXT,
+    risk_level TEXT NOT NULL CHECK(risk_level IN ('Low','Moderate','High','Critical')),
+    trigger_reason TEXT NOT NULL,
+    recommended_action TEXT,
+    supporting_evidence TEXT,
+    status TEXT DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','ACKNOWLEDGED','RESOLVED')),
+    acknowledged_by INTEGER REFERENCES users(id),
+    acknowledged_at TEXT,
+    resolved_by INTEGER REFERENCES users(id),
+    resolved_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS national_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL,
+    district TEXT,
+    disease TEXT NOT NULL,
+    alert_type TEXT CHECK(alert_type IN ('OUTBREAK','CLUSTER','VACCINATION_GAP','CROSS_STATE_TREND')),
+    severity TEXT CHECK(severity IN ('MODERATE','HIGH','CRITICAL')),
+    affected_count INTEGER DEFAULT 0,
+    description TEXT NOT NULL,
+    recommended_measures TEXT,
+    status TEXT DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','RESOLVED')),
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS weather_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    district TEXT NOT NULL,
+    state TEXT DEFAULT 'Maharashtra',
+    lat REAL NOT NULL,
+    lng REAL NOT NULL,
+    temperature REAL NOT NULL,
+    rainfall REAL NOT NULL,
+    humidity REAL NOT NULL,
+    weather_code INTEGER,
+    source TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    fetched_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS ai_animal_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
+    case_id INTEGER REFERENCES cases(id),
+    model_version TEXT NOT NULL DEFAULT 'v1.0-clinical-cds',
+    risk_score REAL NOT NULL,
+    risk_level TEXT NOT NULL,
+    abnormal_findings TEXT,
+    concern_categories TEXT,
+    suggested_next_steps TEXT,
+    follow_up_recommendations TEXT,
+    explanation_factors TEXT,
+    disclaimer TEXT NOT NULL DEFAULT 'AI-assisted decision support — veterinary confirmation required.',
+    input_summary TEXT,
+    confidence REAL NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id INTEGER REFERENCES users(id),
+    actor_name TEXT,
+    actor_role TEXT,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    details TEXT,
+    ip_address TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS offline_sync_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_txn_id TEXT UNIQUE NOT NULL,
+    user_id INTEGER REFERENCES users(id),
+    action TEXT NOT NULL,
+    payload TEXT,
+    synced_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Indexes for high performance
+CREATE INDEX IF NOT EXISTS idx_animal_qr_token ON animal_qr_codes(qr_token);
+CREATE INDEX IF NOT EXISTS idx_animal_qr_animal ON animal_qr_codes(animal_id);
+CREATE INDEX IF NOT EXISTS idx_samples_token ON samples(qr_token);
+CREATE INDEX IF NOT EXISTS idx_samples_code ON samples(sample_code);
+CREATE INDEX IF NOT EXISTS idx_samples_case ON samples(case_id);
+CREATE INDEX IF NOT EXISTS idx_samples_animal ON samples(animal_id);
+CREATE INDEX IF NOT EXISTS idx_custody_sample ON sample_custody_events(sample_id);
+CREATE INDEX IF NOT EXISTS idx_repro_animal ON animal_reproductive_records(animal_id);
+CREATE INDEX IF NOT EXISTS idx_allergy_animal ON animal_allergies(animal_id);
+CREATE INDEX IF NOT EXISTS idx_medication_animal ON animal_medications(animal_id);
+CREATE INDEX IF NOT EXISTS idx_treatment_case ON treatment_responses(case_id);
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
+CREATE INDEX IF NOT EXISTS idx_weather_dist ON weather_observations(district, fetched_at);
 """
 
 
@@ -227,7 +481,40 @@ def next_code(conn, prefix, table, code_col, pad=6, district="PUN"):
         return f"MH-{district}-{str(n).zfill(pad)}"
     if prefix == "HERD":
         return f"HERD-MH-{district}-{str(1000+n)}"
+    if prefix == "SMP":
+        return f"SMP-MH-{district}-{str(100+n)}"
     return f"{prefix}-{str(n).zfill(pad)}"
+
+
+def audit_log(conn, action: str, entity_type: str, entity_id: str,
+              actor_id: int = None, actor_name: str = None, actor_role: str = None,
+              details: dict | str = None, ip: str = None):
+    """Record an audit trail event for full traceability."""
+    details_str = json.dumps(details) if isinstance(details, (dict, list)) else (details or "")
+    conn.execute(
+        "INSERT INTO audit_events (actor_id, actor_name, actor_role, action, entity_type, entity_id, details, ip_address) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (actor_id, actor_name, actor_role, action, entity_type, str(entity_id), details_str, ip)
+    )
+
+
+def calculate_expected_delivery(species: str, breeding_date_str: str) -> str:
+    """Calculate expected delivery date based on species-specific gestation periods:
+    Cattle: ~283 days, Buffalo: ~310 days, Goat: ~150 days, Sheep: ~147 days."""
+    try:
+        b_date = datetime.strptime(str(breeding_date_str).strip()[:10], "%Y-%m-%d").date()
+    except Exception:
+        return ""
+    sp = (species or "").strip().lower()
+    if "buff" in sp:
+        days = 310
+    elif "goat" in sp:
+        days = 150
+    elif "sheep" in sp:
+        days = 147
+    else:
+        days = 283
+    return str(b_date + timedelta(days=days))
 
 
 def init_db(reset=False):
@@ -238,22 +525,25 @@ def init_db(reset=False):
     conn.executescript(SCHEMA)
     ensure_animals_columns(conn)
     migrate_users_role(conn)
+    ensure_new_columns(conn)
     conn.commit()
     if first_time:
         seed(conn)
     ensure_govt_and_stock(conn)
     ensure_campaigns(conn)
+    ensure_lab_user(conn)
+    ensure_qr_for_existing_animals(conn)
+    ensure_extended_seeds(conn)
+    conn.commit()
     conn.close()
 
 
 def ensure_campaigns(conn):
-    """Seed a couple of vaccination campaigns the first time the table is empty.
-    Uses CREATE TABLE IF NOT EXISTS in SCHEMA, so this never touches existing rows."""
+    """Seed a couple of vaccination campaigns the first time the table is empty."""
     count = conn.execute("SELECT COUNT(*) c FROM vaccination_campaigns").fetchone()["c"]
     if count:
         conn.commit()
         return
-    from datetime import timedelta
     today = date.today()
     rows = [
         ("CAMP-MH-PUN-1001", "FMD Mass Vaccination Drive — Pune", "Pune", "FMD",
@@ -273,10 +563,12 @@ def ensure_campaigns(conn):
 
 
 def migrate_users_role(conn):
-    """Older databases constrain role to ('owner','vet'); rebuild the table
-    so the government role is accepted without losing any existing users."""
-    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()["sql"]
-    if "'govt'" in sql:
+    """Ensure users table accepts ('owner','vet','govt','lab') without losing existing data."""
+    sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+    if not sql_row:
+        return
+    sql = sql_row["sql"]
+    if "'lab'" in sql:
         return
     conn.executescript("""
         PRAGMA foreign_keys=OFF;
@@ -287,7 +579,7 @@ def migrate_users_role(conn):
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('owner','vet','govt')),
+            role TEXT NOT NULL CHECK(role IN ('owner','vet','govt','lab')),
             specialization TEXT,
             village TEXT, block TEXT, district TEXT,
             state TEXT DEFAULT 'Maharashtra',
@@ -303,6 +595,7 @@ def migrate_users_role(conn):
         ALTER TABLE users_new RENAME TO users;
         PRAGMA foreign_keys=ON;
     """)
+    conn.commit()
 
 
 def ensure_govt_and_stock(conn):
@@ -327,6 +620,19 @@ def ensure_govt_and_stock(conn):
     conn.commit()
 
 
+def ensure_lab_user(conn):
+    """Ensure a dedicated Laboratory Technician account is seeded."""
+    has_lab = conn.execute("SELECT COUNT(*) c FROM users WHERE role='lab'").fetchone()["c"]
+    if not has_lab:
+        h, s = hash_password("password123")
+        conn.execute(
+            "INSERT INTO users (full_name, mobile, email, password_hash, salt, role, specialization, village, block, district, is_seed) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,1)",
+            ("Dr. Meera Joshi (Lab Tech)", "9800000030", "lab@example.com", h, s, "lab", "Veterinary Pathology", "Shivajinagar", "Haveli", "Pune"),
+        )
+        conn.commit()
+
+
 def ensure_animals_columns(conn):
     existing_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(animals)").fetchall()
@@ -338,6 +644,7 @@ def ensure_animals_columns(conn):
         "age": "REAL",
         "owner_name": "TEXT",
         "mobile": "TEXT",
+        "state": "TEXT DEFAULT 'Maharashtra'",
     }
     for column_name, column_type in extra_columns.items():
         if column_name not in existing_columns:
@@ -357,14 +664,222 @@ def ensure_animals_columns(conn):
             mobile = COALESCE(
                 mobile,
                 (SELECT mobile FROM users WHERE users.id = animals.owner_id)
-            )
+            ),
+            state = COALESCE(state, 'Maharashtra')
         """
     )
+    conn.commit()
+
+
+def ensure_new_columns(conn):
+    """Safely add columns to existing tables if missing."""
+    # lab_reports columns
+    lr_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lab_reports)").fetchall()}
+    lr_needed = {
+        "sample_id": "INTEGER",
+        "test_type": "TEXT",
+        "test_method": "TEXT",
+        "quantitative_result": "REAL",
+        "units": "TEXT",
+        "reference_range_min": "REAL",
+        "reference_range_max": "REAL",
+        "reference_range_text": "TEXT",
+        "abnormal_flag": "TEXT DEFAULT 'Normal'",
+        "technician_name": "TEXT",
+        "verification_status": "TEXT DEFAULT 'UNVERIFIED'",
+        "verified_by": "INTEGER",
+        "verified_at": "TEXT",
+        "comments": "TEXT",
+        "published_at": "TEXT",
+    }
+    for col, col_t in lr_needed.items():
+        if col not in lr_cols:
+            conn.execute(f"ALTER TABLE lab_reports ADD COLUMN {col} {col_t}")
+
+    # prescriptions columns
+    p_cols = {row["name"] for row in conn.execute("PRAGMA table_info(prescriptions)").fetchall()}
+    p_needed = {
+        "allergy_override": "INTEGER DEFAULT 0",
+        "override_reason": "TEXT",
+    }
+    for col, col_t in p_needed.items():
+        if col not in p_cols:
+            conn.execute(f"ALTER TABLE prescriptions ADD COLUMN {col} {col_t}")
+
+    # cases columns
+    c_cols = {row["name"] for row in conn.execute("PRAGMA table_info(cases)").fetchall()}
+    if "farm_alert_id" not in c_cols:
+        conn.execute("ALTER TABLE cases ADD COLUMN farm_alert_id INTEGER")
+
+    # herds columns
+    h_cols = {row["name"] for row in conn.execute("PRAGMA table_info(herds)").fetchall()}
+    if "state" not in h_cols:
+        conn.execute("ALTER TABLE herds ADD COLUMN state TEXT DEFAULT 'Maharashtra'")
+
+    conn.commit()
+
+
+def ensure_qr_for_existing_animals(conn):
+    """Ensure every existing registered animal has an active QR identity token."""
+    animals = conn.execute("SELECT id, animal_code FROM animals").fetchall()
+    for a in animals:
+        exists = conn.execute("SELECT id FROM animal_qr_codes WHERE animal_id=?", (a["id"],)).fetchone()
+        if not exists:
+            token = f"aqr_{uuid.uuid4().hex}"
+            payload = f"PASHU:ANIMAL:{token}"
+            conn.execute(
+                "INSERT INTO animal_qr_codes (animal_id, qr_token, qr_payload, status) VALUES (?,?,?, 'ACTIVE')",
+                (a["id"], token, payload)
+            )
+            audit_log(conn, "CREATE_QR", "animal", a["id"], details={"animal_code": a["animal_code"], "qr_token": token})
+    conn.commit()
+
+
+def ensure_extended_seeds(conn):
+    """Ensure reproductive records, allergies, sample records, and alerts have initial data."""
+    # Check if a1 has a reproductive record
+    a1 = conn.execute("SELECT id FROM animals WHERE animal_code='MH-PUN-000001'").fetchone()
+    vet1 = conn.execute("SELECT id FROM users WHERE email='vet1@example.com'").fetchone()
+    vet_id = vet1["id"] if vet1 else 1
+
+    if a1:
+        aid = a1["id"]
+        # Seed reproductive record for cow Gauri
+        has_repro = conn.execute("SELECT COUNT(*) c FROM animal_reproductive_records WHERE animal_id=?", (aid,)).fetchone()["c"]
+        if not has_repro:
+            today = date.today()
+            breeding_d = str(today - timedelta(days=120))
+            expected_d = calculate_expected_delivery("Cattle", breeding_d)
+            conn.execute(
+                """
+                INSERT INTO animal_reproductive_records
+                (animal_id, pregnancy_status, breeding_date, mating_service_date, expected_delivery_date,
+                 pregnancy_confirmation_date, previous_pregnancies, offspring_count, event_type, breeding_notes, recorded_by)
+                VALUES (?,?,?,?,?,?,2,2,'Pregnancy Check','Artificial Insemination confirmed pregnant via rectal palpation.',?)
+                """,
+                (aid, "Confirmed Pregnant", breeding_d, breeding_d, expected_d, str(today - timedelta(days=60)), vet_id)
+            )
+
+        # Seed allergy for cow Gauri (Penicillin allergy to test conflict checks)
+        has_allergy = conn.execute("SELECT COUNT(*) c FROM animal_allergies WHERE animal_id=?", (aid,)).fetchone()["c"]
+        if not has_allergy:
+            conn.execute(
+                """
+                INSERT INTO animal_allergies (animal_id, allergen, allergy_severity, reaction, recorded_by, status, notes)
+                VALUES (?, 'Penicillin', 'Severe', 'Anaphylactic distress and urticaria observed post-administration', ?, 'Active', 'Cross-reactive with beta-lactams and ampicillin.')
+                """,
+                (aid, vet_id)
+            )
+
+        # Seed active medication
+        has_med = conn.execute("SELECT COUNT(*) c FROM animal_medications WHERE animal_id=?", (aid,)).fetchone()["c"]
+        if not has_med:
+            today = date.today()
+            conn.execute(
+                """
+                INSERT INTO animal_medications (animal_id, medication_name, dosage, frequency, start_date, end_date, status, prescribed_by, notes)
+                VALUES (?, 'Meloxicam', '0.5 mg/kg', 'Once daily', ?, ?, 'Active', ?, 'Anti-inflammatory treatment')
+                """,
+                (aid, str(today - timedelta(days=2)), str(today + timedelta(days=3)), vet_id)
+            )
+
+    # Seed initial digital sample for case 1 if not exists
+    case1 = conn.execute("SELECT id, animal_id FROM cases WHERE case_no='CASE-000801'").fetchone()
+    if case1:
+        has_sample = conn.execute("SELECT COUNT(*) c FROM samples WHERE case_id=?", (case1["id"],)).fetchone()["c"]
+        if not has_sample:
+            stoken = f"sqr_{uuid.uuid4().hex}"
+            spayload = f"PASHU:SAMPLE:{stoken}"
+            scur = conn.execute(
+                """
+                INSERT INTO samples (sample_code, qr_token, qr_payload, animal_id, case_id, sample_type,
+                                    status, collector_id, collection_lat, collection_lng, is_manual_location,
+                                    collection_notes, transporter_name, transporter_phone)
+                VALUES (?,?,?,?,?,'Blood Sample','COMPLETED',?,18.5793,73.9787,0,
+                        'Sterile EDTA tube collection, 10ml blood','Sanjay Shinde','9822001122')
+                """,
+                ("SMP-MH-PUN-000101", stoken, spayload, case1["animal_id"], case1["id"], vet_id)
+            )
+            s_id = scur.lastrowid
+            # Custody events
+            t0 = datetime.now() - timedelta(hours=8)
+            t1 = datetime.now() - timedelta(hours=6)
+            t2 = datetime.now() - timedelta(hours=4)
+            t3 = datetime.now() - timedelta(hours=2)
+            conn.execute(
+                "INSERT INTO sample_custody_events (sample_id, status, action, actor_name, actor_role, lat, lng, notes, timestamp) "
+                "VALUES (?, 'COLLECTED', 'Sample drawn from jugular vein', 'Dr. Ananya Kulkarni', 'vet', 18.5793, 73.9787, 'Collected in Wagholi farm', ?)",
+                (s_id, t0.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            conn.execute(
+                "INSERT INTO sample_custody_events (sample_id, status, action, actor_name, actor_role, notes, timestamp) "
+                "VALUES (?, 'PICKED_UP', 'Transferred to cold-chain courier', 'Sanjay Shinde', 'transporter', 'Cold chain 4°C maintained', ?)",
+                (s_id, t1.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            conn.execute(
+                "INSERT INTO sample_custody_events (sample_id, status, action, actor_name, actor_role, notes, timestamp) "
+                "VALUES (?, 'LAB_RECEIVED', 'Received and verified at Pune District Lab', 'Dr. Meera Joshi (Lab Tech)', 'lab', 'Sample integrity verified', ?)",
+                (s_id, t2.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            conn.execute(
+                "INSERT INTO sample_custody_events (sample_id, status, action, actor_name, actor_role, notes, timestamp) "
+                "VALUES (?, 'COMPLETED', 'Culture and microscopic examination completed', 'Dr. Meera Joshi (Lab Tech)', 'lab', 'Report LAB-000501 published', ?)",
+                (s_id, t3.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            # Update existing lab report to link sample_id
+            conn.execute(
+                """
+                UPDATE lab_reports
+                SET sample_id=?, test_type='Bacteriology', test_method='Blood Culture & Gram Stain',
+                    quantitative_result=0.0, units='CFU/mL', reference_range_text='No bacterial growth in 48h',
+                    abnormal_flag='Normal', technician_name='Dr. Meera Joshi (Lab Tech)', verification_status='VERIFIED',
+                    verified_at=datetime('now'), comments='Sterile blood culture, no Pasteurella multocida isolated'
+                WHERE report_no='LAB-000501'
+                """,
+                (s_id,)
+            )
+
+    # Seed structured treatment response for case 1
+    if case1:
+        has_tr = conn.execute("SELECT COUNT(*) c FROM treatment_responses WHERE case_id=?", (case1["id"],)).fetchone()["c"]
+        if not has_tr:
+            conn.execute(
+                """
+                INSERT INTO treatment_responses (case_id, animal_id, response, response_date, veterinarian_id, veterinarian_name, objective_observations, notes)
+                VALUES (?, ?, 'improved', date('now'), ?, 'Dr. Ananya Kulkarni', 'Body temperature normalized to 101.4°F, rumination resumed, feeding normally.', 'Continue oral hydration and monitor for 48 hours.')
+                """,
+                (case1["id"], case1["animal_id"], vet_id)
+            )
+
+    # Seed farm alert if none exists
+    has_fa = conn.execute("SELECT COUNT(*) c FROM farm_alerts").fetchone()["c"]
+    if not has_fa:
+        conn.execute(
+            """
+            INSERT INTO farm_alerts (herd_id, herd_code, district, disease, affected_animals_count, affected_animals_codes, risk_level, trigger_reason, recommended_action, supporting_evidence, status)
+            VALUES (1, 'HERD-MH-PUN-1001', 'Pune', 'HS (suspected)', 1, 'MH-PUN-000001', 'Moderate',
+                    'Active acute respiratory and fever case detected in Wagholi cluster',
+                    'Perform preventive herd ring vaccination and temperature screening',
+                    'Case CASE-000801 with medium severity symptoms reported', 'ACTIVE')
+            """
+        )
+
+    # Seed national alert if none exists
+    has_na = conn.execute("SELECT COUNT(*) c FROM national_alerts").fetchone()["c"]
+    if not has_na:
+        conn.execute(
+            """
+            INSERT INTO national_alerts (title, state, district, disease, alert_type, severity, affected_count, description, recommended_measures, status)
+            VALUES ('Western Maharashtra HS Surveillance Alert', 'Maharashtra', 'Pune', 'HS', 'CLUSTER', 'HIGH', 1,
+                    'Pre-monsoon Haemorrhagic Septicaemia surveillance alert across Pune and Satara districts.',
+                    'Mandatory ring vaccination in 5km buffer zone around reported cases.', 'ACTIVE')
+            """
+        )
+
+    conn.commit()
 
 
 def seed(conn):
-    from datetime import timedelta
-
     def add_user(name, mobile, email, pw, role, district, village="Haveli", block="Haveli", spec=None):
         h, s = hash_password(pw)
         cur = conn.execute(
@@ -378,6 +893,7 @@ def seed(conn):
     owner2 = add_user("Sunita More", "9800000002", "sunita@example.com", "password123", "owner", "Nashik")
     vet1 = add_user("Dr. Ananya Kulkarni", "9800000010", "vet1@example.com", "password123", "vet", "Pune", spec="Livestock Medicine")
     add_user("Dr. Suresh Deshmukh", "9800000011", "vet2@example.com", "password123", "vet", "Nashik", spec="Epidemiology")
+    add_user("Dr. Meera Joshi (Lab Tech)", "9800000030", "lab@example.com", "password123", "lab", "Pune", spec="Veterinary Pathology")
 
     herd1 = conn.execute(
         "INSERT INTO herds (herd_code, owner_id, village, block, district, is_seed) VALUES (?,?,?,?,?,1)",
