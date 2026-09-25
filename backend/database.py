@@ -22,7 +22,9 @@ import json
 import uuid
 from datetime import datetime, date, timedelta
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "animal_health.db")
+# Optional test/deployment override so a throw-away database can be used
+# without touching the bundled animal_health.db.
+DB_PATH = os.environ.get("SIH_DB_PATH") or os.path.join(os.path.dirname(__file__), "animal_health.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -517,6 +519,19 @@ def calculate_expected_delivery(species: str, breeding_date_str: str) -> str:
     return str(b_date + timedelta(days=days))
 
 
+def ensure_ivr_schema(conn):
+    """Create/upgrade the additive IVR reporting tables.
+
+    Imported lazily so the core database module keeps no dependency on the
+    IVR package (which imports this module).
+    """
+    try:
+        from ivr.schema import ensure_ivr_schema as _ensure
+    except Exception:
+        return
+    _ensure(conn)
+
+
 def init_db(reset=False):
     if reset and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
@@ -527,13 +542,17 @@ def init_db(reset=False):
     migrate_users_role(conn)
     ensure_new_columns(conn)
     conn.commit()
-    if first_time:
+    # Seed on a brand-new database, or on a database that was created before
+    # the core schema was ever populated (e.g. bootstrapped by the IVR layer).
+    user_count = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    if first_time or not user_count:
         seed(conn)
     ensure_govt_and_stock(conn)
     ensure_campaigns(conn)
     ensure_lab_user(conn)
     ensure_qr_for_existing_animals(conn)
     ensure_extended_seeds(conn)
+    ensure_ivr_schema(conn)
     conn.commit()
     conn.close()
 

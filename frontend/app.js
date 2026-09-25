@@ -532,6 +532,7 @@ async function vetDashboard() {
         ${iconItem("💉", "Record Vaccination", "#/vet/vaccination/new")}
         ${iconItem("🗓️", "Vax Campaigns", "#/vet/campaigns")}
         ${iconItem("🌐", "Surveillance", "#/vet/surveillance")}
+        ${iconItem("📞", "IVR Reports", "#/vet/ivr-reports")}
         ${iconItem("🚨", "Farm Alerts", "#/vet/farm-alerts")}
         ${iconItem("💊", "Prescriptions", "#/vet/prescriptions")}
         ${iconItem("📖", "Disease Info", "#/vet/diseases")}
@@ -570,6 +571,15 @@ async function govtDashboard() {
     <div class="section-card">
       <div class="section-title">🥧 Most Spread Diseases</div>
       ${pieChart(a.disease_spread)}
+    </div>
+    <div class="section-card">
+      <div class="section-title">📞 IVR Helpline (Phone Reporting)</div>
+      <div class="meta">Reports submitted by farmers calling the IVR number — calls, surveys, reports & configuration.</div>
+      <div class="btn-row" style="margin-top:12px">
+        <button class="btn btn-primary btn-sm" onclick="location.hash='#/govt/ivr'">IVR Analytics</button>
+        <button class="btn btn-ghost btn-sm" onclick="location.hash='#/govt/ivr/calls'">Call History</button>
+        <button class="btn btn-ghost btn-sm" onclick="location.hash='#/govt/ivr/config'">Configuration</button>
+      </div>
     </div>
     <div class="section-card">
       <div class="section-title">🚨 Herd & Farm Alerts</div>
@@ -2073,7 +2083,7 @@ function casesListView(role) {
       <div class="section-card">
         ${cases.length === 0 ? emptyState("No active cases.") : cases.map(c => `
           <div class="list-card" onclick="location.hash='#/${role}/cases/${c.id}'">
-            <div class="row1"><span class="title">${c.case_no}</span><span class="badge ${statusBadgeClass(c.status)}">${c.status}</span></div>
+            <div class="row1"><span class="title">${c.case_no}${c.reported_through === "IVR" ? ' <span class="badge badge-blue">📞 IVR</span>' : ""}</span><span class="badge ${statusBadgeClass(c.status)}">${c.status}</span></div>
             <div class="meta"><b>Animal:</b> ${c.animal ? c.animal.animal_code : "—"} · ${c.symptoms || "—"}</div>
             <div class="meta">Owner: ${c.owner ? c.owner.full_name : "—"} · Reported: ${fmtDate(c.created_at)}</div>
           </div>`).join("")}
@@ -2134,6 +2144,11 @@ function caseDetailView(role) {
         </div>
         ${c.description ? `<div style="margin-top:10px"><b class="small-muted">Description:</b><div style="font-size:13.5px">${c.description}</div></div>` : ""}
       </div>
+
+      ${c.reported_through === "IVR" ? `<div id="ivrCasePanel" class="section-card">
+        <div class="subheading">📞 IVR Call Report</div>
+        <div class="loading" style="padding:14px">Loading IVR details…</div>
+      </div>` : ""}
 
       <!-- ALLERGY ALERT BANNER IF APPLICABLE -->
       ${allergies.length > 0 ? `
@@ -2288,9 +2303,65 @@ function caseDetailView(role) {
 
     if (isVet) bindVetCaseActions(c, allergies);
     loadTracking(c, role);
+    if (c.reported_through === "IVR") loadIvrCasePanel(id, role, isVet);
   }, [role]);
 }
 caseDetailView("owner"); caseDetailView("vet"); caseDetailView("govt");
+
+async function loadIvrCasePanel(caseId, role, isVet) {
+  const wrap = document.getElementById("ivrCasePanel");
+  if (!wrap) return;
+  try {
+    const panel = await api(`/ivr/case/${caseId}`);
+    if (!panel || !panel.report) { wrap.innerHTML = ""; return; }
+    const r = panel.report;
+    const st = panel.structured || {};
+    const animal = st.animal || {};
+    const loc = st.location || {};
+    const call = panel.call || {};
+    const urgencyClass = r.urgency === "CRITICAL" || r.urgency === "HIGH" ? "badge-red" : r.urgency === "MEDIUM" ? "badge-orange" : "badge-green";
+    const transcript = (panel.transcript || []).filter(t => t.text && t.text.length > 0);
+    wrap.innerHTML = `
+      <div class="detail-grid">
+        <div><b>Report</b>${r.report_no} <span class="badge ${urgencyClass}">${r.urgency}</span></div>
+        <div><b>IVR Status</b><span class="badge ${statusBadgeClass((r.status || "").toLowerCase())}">${r.status}</span></div>
+        <div><b>Call ID</b>${call.provider_call_id || "—"}</div>
+        <div><b>Language</b>${(r.language || "en").toUpperCase()}</div>
+        <div><b>Caller</b>${r.caller_number_masked || "Not available"}</div>
+        <div><b>Call Time</b>${fmtDate(call.started_at)}</div>
+        <div><b>Animal</b>${animal.species || "—"}${animal.count ? " × " + animal.count : ""}${animal.breed && animal.breed !== "Not provided" ? " (" + animal.breed + ")" : ""}</div>
+        <div><b>Location</b>${loc.village || "—"}, ${loc.district || "—"} <span class="small-muted">(${loc.source || "NOT_AVAILABLE"})</span></div>
+      </div>
+      ${r.symptoms && r.symptoms.length ? `<div style="margin-top:8px"><b class="small-muted">Symptoms</b>${r.symptoms.map(x => `<span class="badge badge-orange" style="margin:2px">${x}</span>`).join(" ")}</div>` : ""}
+      ${r.ai_summary ? `
+        <div class="voice-transcript" style="margin-top:10px">
+          <b>Structured summary</b> <span class="badge badge-blue">${r.ai_generated ? "AI GENERATED" : "SYSTEM GENERATED"}</span>
+          <div style="margin-top:6px">${r.ai_summary}</div>
+          <div class="small-muted" style="margin-top:6px">⚕️ ${r.ai_generated ? "AI-generated summary — veterinarian verification required." : "System-generated structured summary from IVR input — veterinarian verification required."}</div>
+        </div>` : ""}
+      ${transcript.length ? `
+        <div class="subheading" style="margin-top:12px">🎙 Transcript (where available)</div>
+        ${transcript.map(t => `<div class="meta"><b>[${t.participant_role}]</b> ${t.text}</div>`).join("")}` : ""}
+      ${isVet ? `
+        <div class="btn-row" style="margin-top:12px">
+          ${!r.ai_verified_by_vet ? `<button class="btn btn-outline btn-sm" onclick="ivrVerifyReport(${r.id})">✓ Verify this summary</button>` : `<span class="badge badge-green">VET VERIFIED</span>`}
+          <button class="btn btn-ghost btn-sm" onclick="location.hash='#/vet/ivr-reports/${r.id}'">Open IVR Report</button>
+        </div>` : `
+        <div class="btn-row" style="margin-top:12px">
+          <button class="btn btn-ghost btn-sm" onclick="location.hash='#/govt/ivr-reports/${r.id}'">Open IVR Report</button>
+        </div>`}
+    `;
+  } catch (e) {
+    wrap.innerHTML = `<div class="meta">IVR details unavailable.</div>`;
+  }
+}
+window.ivrVerifyReport = async function (reportId) {
+  try {
+    await api(`/ivr/reports/${reportId}/verify`, { method: "POST", body: { note: "Verified in case view" } });
+    toast("AI summary marked as veterinarian verified.");
+    router();
+  } catch (err) { toast(err.message, true); }
+};
 
 window.showSampleQrModal = async function(sid) {
   try {
@@ -2689,7 +2760,7 @@ function notificationsView(role) {
 }
 notificationsView("owner"); notificationsView("vet"); notificationsView("govt"); notificationsView("lab");
 
-function iconForType(t2) { return { case: "🩺", lab: "🧪", prescription: "💊", vaccination: "💉" }[t2] || "🔔"; }
+function iconForType(t2) { return { case: "🩺", lab: "🧪", prescription: "💊", vaccination: "💉", ivr: "📞" }[t2] || "🔔"; }
 
 window.markRead = async function (id) {
   try { await api(`/notifications/${id}/read`, { method: "PUT" }); router(); } catch (e) { }
@@ -2703,4 +2774,388 @@ window.deleteCase = async function (id, caseNo) {
   if (!confirm(`Delete report ${caseNo}? This removes the case, its lab reports and prescriptions permanently.`)) return;
   try { await api(`/cases/${id}`, { method: "DELETE" }); toast(`Report ${caseNo} deleted`); location.hash = "#/vet/reports"; }
   catch (err) { toast(err.message, true); }
+};
+
+// =====================================================================
+// IVR REPORTING CHANNEL — minimal additive views (existing design system)
+// =====================================================================
+function ivrUrgencyBadge(u) {
+  const s = (u || "").toUpperCase();
+  const cls = (s === "CRITICAL" || s === "HIGH") ? "badge-red" : (s === "MEDIUM" ? "badge-orange" : "badge-green");
+  return `<span class="badge ${cls}">${s || "—"}</span>`;
+}
+function ivrStatusBadge(s) {
+  const map = { received: "badge-blue", ai_summarized: "badge-blue", vet_notified: "badge-orange",
+                under_review: "badge-orange", vet_contacted: "badge-orange",
+                action_recommended: "badge-orange", follow_up: "badge-orange",
+                resolved: "badge-green", closed: "badge-green" };
+  return `<span class="badge ${map[(s || "").toLowerCase()] || "badge-blue"}">${s || "—"}</span>`;
+}
+
+function ivrReportCards(reports, role) {
+  if (!reports.length) return emptyState("No IVR reports yet.");
+  return reports.map(r => `
+    <div class="list-card" onclick="location.hash='#/${role}/ivr-reports/${r.id}'">
+      <div class="row1">
+        <span class="title">${r.report_no}${r.is_duplicate ? ' <span class="badge badge-orange">POSSIBLE DUPLICATE</span>' : ""}</span>
+        ${ivrStatusBadge(r.status)}
+      </div>
+      <div class="meta"><b>Animal:</b> ${(r.animal && r.animal.species) || "—"}${r.animal && r.animal.count ? " × " + r.animal.count : ""} · <b>Urgency:</b> ${ivrUrgencyBadge(r.urgency)}</div>
+      <div class="meta"><b>Location:</b> ${((r.location && r.location.village) || "—")}, ${((r.location && r.location.district) || "—")} (${((r.location && r.location.source) || "NOT_AVAILABLE")})</div>
+      <div class="meta"><b>Caller:</b> ${r.caller_number_masked || "Not available"} · <b>Lang:</b> ${(r.language || "en").toUpperCase()} · ${fmtDate(r.created_at)}</div>
+    </div>`).join("");
+}
+
+function ivrReportsList(role) {
+  route(`#/${role}/ivr-reports`, async () => {
+    render(`${header("IVR Reports", { back: true })}<div class="loading">Loading IVR reports…</div>`);
+    let reports = [];
+    try { reports = await api("/ivr/reports"); } catch (e) { toast(e.message, true); }
+    render(`
+      ${header("📞 IVR Reports (Phone Channel)", { back: true })}
+      <div class="section-card">
+        <div class="section-title">Reports received by phone</div>
+        ${ivrReportCards(reports, role)}
+      </div>
+      ${bottomNav(role === "vet" ? "#/vet/reports" : "#/govt/dashboard")}
+    `);
+  }, [role]);
+}
+ivrReportsList("vet");
+ivrReportsList("govt");
+
+route("#/:role/ivr-reports/:id", async ({ role, id }) => {
+  render(`${header("IVR Report", { back: true })}<div class="loading">Loading report…</div>`);
+  let d = null;
+  try { d = await api(`/ivr/reports/${id}`); } catch (e) { render(`${header("IVR Report", { back: true })}<div class="loading">⚠️ ${e.message}</div>`); return; }
+  const r = d.report, st = d.structured || {}, call = d.call || {};
+  const animal = st.animal || {}, loc = st.location || {};
+  const missing = r.missing_fields ? JSON.parse(r.missing_fields || "[]") : [];
+  const dupReasons = r.duplicate_reasons ? JSON.parse(r.duplicate_reasons || "[]") : [];
+  const responses = (d.responses || []).filter(x => x.question_key);
+  const transcripts = (d.transcripts || []).filter(t => t.text);
+  const events = (d.events || []).slice().reverse();
+  const isVet = role === "vet";
+  const statusOptions = ["RECEIVED","AI_SUMMARIZED","VET_NOTIFIED","UNDER_REVIEW","VET_CONTACTED","ACTION_RECOMMENDED","FOLLOW_UP","RESOLVED","CLOSED"];
+  render(`
+    ${header(r.report_no, { back: true })}
+    <div class="section-card">
+      <div class="row1" style="justify-content:space-between;display:flex;align-items:center;margin-bottom:8px">
+        ${ivrStatusBadge(r.status)} ${ivrUrgencyBadge(r.urgency)}
+        <span class="badge badge-blue">SOURCE: IVR</span>
+      </div>
+      <div class="detail-grid">
+        <div><b>Linked Case</b>${r.case_id ? `<a class="link" onclick="location.hash='#/${role}/cases/${r.case_id}'">Case #${r.case_id}</a>` : "—"}</div>
+        <div><b>Call ID</b>${call.provider_call_id || "—"}</div>
+        <div><b>Provider</b>${call.provider || "—"}</div>
+        <div><b>Language</b>${(r.language || "en").toUpperCase()}</div>
+        <div><b>Caller</b>${r.caller_number_masked || "Not available"} <span class="small-muted">(${call.caller_number_status || "—"})</span></div>
+        <div><b>Call Duration</b>${call.duration_seconds ? call.duration_seconds + "s" : "—"}</div>
+        <div><b>Report Flow</b>${(r.flow || "SURVEY").replace("_", " ")}</div>
+        <div><b>Received</b>${fmtDate(r.created_at)}</div>
+      </div>
+      ${dupReasons.length ? `<div class="conflict-box" style="margin-top:10px"><b>⚠️ Possible duplicate</b>${dupReasons.join(" · ")}${r.duplicate_of ? ` · Duplicate of report #${r.duplicate_of}` : ""}</div>` : ""}
+      ${missing.length ? `<div class="meta" style="margin-top:8px"><b>Not captured:</b> ${missing.join(", ")}</div>` : ""}
+    </div>
+
+    <div class="section-card">
+      <div class="subheading">🐄 Structured Report</div>
+      <div class="detail-grid">
+        <div><b>Species</b>${animal.species || "Not provided"}${animal.count ? " × " + animal.count : ""}</div>
+        <div><b>Breed</b>${animal.breed || "Not provided"}</div>
+        <div><b>Age</b>${animal.age || "Not provided"}</div>
+        <div><b>Sex</b>${animal.sex || "Not provided"}</div>
+        <div><b>Problem</b>${st.problem || "Not provided"}</div>
+        <div><b>Duration</b>${st.duration || "Not provided"}</div>
+        <div><b>Eating / Drinking</b>${st.eating || "—"} / ${st.drinking || "—"}</div>
+        <div><b>Temperature</b>${st.temperature || "Not provided"}</div>
+        <div><b>Vaccination</b>${st.vaccination_status || "Not provided"}</div>
+        <div><b>Pregnancy</b>${st.pregnancy_status || "Not provided"}</div>
+        <div><b>Village</b>${loc.village || "Not provided"}</div>
+        <div><b>District</b>${loc.district || "Not provided"}</div>
+        <div><b>State</b>${loc.state || "—"}</div>
+        <div><b>Location Source</b>${loc.source || "NOT_AVAILABLE"}${loc.lat ? ` (${Number(loc.lat).toFixed(4)}, ${Number(loc.lng).toFixed(4)})` : ""}</div>
+      </div>
+      ${st.symptoms && st.symptoms.length ? `<div style="margin-top:8px"><b class="small-muted">Symptoms</b><div class="tag-row">${st.symptoms.map(x => `<span class="badge badge-orange">${x}</span>`).join(" ")}</div></div>` : ""}
+      ${st.previous_treatment && st.previous_treatment.length ? `<div style="margin-top:8px"><b class="small-muted">Treatment already given</b><div class="meta">${st.previous_treatment.join(", ")}</div></div>` : ""}
+      ${st.additional_description && st.additional_description !== "Not provided" ? `<div style="margin-top:8px"><b class="small-muted">Additional</b><div class="meta">${st.additional_description}</div></div>` : ""}
+    </div>
+
+    ${r.ai_summary ? `
+    <div class="section-card">
+      <div class="subheading">🤖 Structured Summary <span class="badge ${r.ai_generated ? "badge-orange" : "badge-blue"}">${r.ai_generated ? "AI GENERATED" : "SYSTEM GENERATED"}</span>
+        ${r.ai_verified_by_vet ? '<span class="badge badge-green">VET VERIFIED</span>' : ""}</div>
+      <div class="voice-transcript" style="margin:0">${r.ai_summary}</div>
+      <div class="small-muted" style="margin-top:8px">⚕️ ${r.ai_generated ? "AI-generated summary — veterinarian verification required." : "System-generated structured summary from IVR input — veterinarian verification required."} Model: ${r.ai_model || "—"}</div>
+    </div>` : ""}
+
+    ${transcripts.length ? `
+    <div class="section-card">
+      <div class="subheading">🎙 Call Transcript (original language preserved)</div>
+      ${transcripts.map(t => `<div class="meta" style="margin-bottom:6px"><b>[${t.participant_role}]</b> <span class="small-muted">(${t.language})</span> ${t.text}</div>`).join("")}
+    </div>` : `<div class="section-card"><div class="subheading">🎙 Call Transcript</div><div class="meta">No transcript available (speech-to-text not configured for this call, or call had none).</div></div>`}
+
+    <div class="section-card">
+      <div class="subheading">📋 Survey Answers (${responses.length})</div>
+      ${responses.length ? responses.map(x => `
+        <div class="meta" style="margin-bottom:4px"><b>${x.question_key}</b> — ${x.normalized_value || "—"} <span class="small-muted">(${x.input_mode || "—"}${x.confidence ? ", " + Number(x.confidence).toFixed(2) : ""})</span></div>
+      `).join("") : emptyState("No answers recorded.")}
+    </div>
+
+    ${(isVet || role === "govt") ? `
+    <div class="section-card">
+      <div class="subheading">⚙️ Status & Actions</div>
+      <div class="form-row" style="margin-bottom:10px">
+        <div class="field"><label>IVR report status</label>
+          <select id="ivrStatusSel">${statusOptions.map(o => `<option ${o === r.status ? "selected" : ""}>${o}</option>`).join("")}</select>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" onclick="ivrSetStatus(${r.id})">Update Status</button>
+        ${isVet && !r.ai_verified_by_vet ? `<button class="btn btn-outline btn-sm" onclick="ivrVerifyReport(${r.id})">✓ Verify AI Summary</button>` : ""}
+        ${role === "govt" && r.is_duplicate ? `<button class="btn btn-ghost btn-sm" onclick="document.getElementById('mergeTarget').style.display='block'">Merge Duplicate…</button>` : ""}
+      </div>
+      ${role === "govt" && r.is_duplicate ? `
+      <div id="mergeTarget" style="display:none;margin-top:10px;background:#f8f9fe;padding:12px;border-radius:12px">
+        <div class="field"><label>Merge into report id</label><input id="mergeTargetId" placeholder="e.g. 3" /></div>
+        <button class="btn btn-outline btn-sm" onclick="ivrMergeReport(${r.id})">Merge Reports</button>
+      </div>` : ""}
+    </div>` : ""}
+
+    <div class="section-card">
+      <div class="subheading">🕒 IVR Event Timeline</div>
+      <div class="timeline">
+        ${events.map(e => `
+          <div class="timeline-item">
+            <div class="timeline-dot"></div>
+            <div class="timeline-body">
+              <div class="t-status">${e.event_type}</div>
+              <div class="t-note">${e.actor || ""} ${e.details ? "" : ""}</div>
+              <div class="t-date">${fmtDate(e.created_at)}</div>
+            </div>
+          </div>`).join("") || emptyState("No events.")}
+      </div>
+    </div>
+    ${bottomNav(role === "vet" ? "#/vet/reports" : "#/govt/dashboard")}
+  `);
+}, ["vet", "govt"]);
+
+window.ivrSetStatus = async function (reportId) {
+  const sel = document.getElementById("ivrStatusSel");
+  try {
+    await api(`/ivr/reports/${reportId}/status`, { method: "POST", body: { status: sel.value } });
+    toast("IVR report status updated.");
+    router();
+  } catch (err) { toast(err.message, true); }
+};
+window.ivrMergeReport = async function (reportId) {
+  const target = document.getElementById("mergeTargetId").value;
+  if (!target) { toast("Enter the target report id.", true); return; }
+  try {
+    await api(`/ivr/reports/${reportId}/merge`, { method: "POST", body: { target_report_id: Number(target) } });
+    toast("Reports merged.");
+    router();
+  } catch (err) { toast(err.message, true); }
+};
+
+route("#/govt/ivr/calls", async () => {
+  render(`${header("IVR Call History", { back: true })}<div class="loading">Loading calls…</div>`);
+  let calls = [];
+  try { calls = await api("/ivr/calls?limit=100"); } catch (e) { toast(e.message, true); }
+  render(`
+    ${header("📞 IVR Call History", { back: true })}
+    <div class="section-card">
+      <div class="table-wrap"><table class="data-table">
+        <thead><tr><th>Call</th><th>Caller</th><th>Lang</th><th>Flow</th><th>Status</th><th>Duration</th><th>Started</th></tr></thead>
+        <tbody>
+          ${calls.length ? calls.map(c => `
+            <tr>
+              <td><a class="link" onclick="location.hash='#/govt/ivr/call/${c.id}'">${c.provider_call_id ? String(c.provider_call_id).slice(0, 14) : "#" + c.id}</a></td>
+              <td>${c.caller_number_masked || "—"} <span class="small-muted">(${c.caller_number_status || "—"})</span></td>
+              <td>${(c.language || "—").toUpperCase()}</td>
+              <td>${(c.flow || "—").replace("_", " ")}</td>
+              <td>${ivrStatusBadge(c.status)}</td>
+              <td>${c.duration_seconds ? c.duration_seconds + "s" : "—"}</td>
+              <td>${fmtDate(c.started_at)}</td>
+            </tr>`).join("") : `<tr><td colspan="7" class="empty-state">No calls recorded yet.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>
+    ${bottomNav("#/govt/dashboard")}
+  `);
+}, ["govt"]);
+
+route("#/govt/ivr/call/:id", async ({ id }) => {
+  render(`${header("IVR Call", { back: true })}<div class="loading">Loading call…</div>`);
+  let c = null;
+  try { c = await api(`/ivr/calls/${id}`); } catch (e) { render(`${header("IVR Call", { back: true })}<div class="loading">⚠️ ${e.message}</div>`); return; }
+  render(`
+    ${header("Call " + (c.provider_call_id || "#" + c.id), { back: true })}
+    <div class="section-card">
+      <div class="detail-grid">
+        <div><b>Caller</b>${c.caller_number_masked || "—"} (${c.caller_number_status || "—"})</div>
+        <div><b>Language</b>${(c.language || "—").toUpperCase()} (${c.language_source || "—"})</div>
+        <div><b>Flow</b>${(c.flow || "—").replace("_", " ")}</div>
+        <div><b>Status</b>${ivrStatusBadge(c.status)}</div>
+        <div><b>Duration</b>${c.duration_seconds ? c.duration_seconds + "s" : "—"}</div>
+        <div><b>Started</b>${fmtDate(c.started_at)}</div>
+        <div><b>Recording Consent</b>${c.consent_recording ? "Given" : "Not required / declined"}</div>
+        <div><b>Provider</b>${c.provider || "—"}</div>
+      </div>
+    </div>
+    <div class="section-card">
+      <div class="subheading">Survey Answers</div>
+      ${(c.responses || []).length ? c.responses.map(x => `<div class="meta"><b>${x.question_key}</b> — ${x.normalized_value || "—"} <span class="small-muted">(${x.input_mode || "—"})</span></div>`).join("") : emptyState("No answers.")}
+    </div>
+    <div class="section-card">
+      <div class="subheading">Events</div>
+      ${(c.events || []).length ? c.events.map(e => `<div class="meta"><b>${e.event_type}</b> — ${fmtDate(e.created_at)}</div>`).join("") : emptyState("No events.")}
+    </div>
+    ${bottomNav("#/govt/dashboard")}
+  `);
+}, ["govt"]);
+
+route("#/govt/ivr", async () => {
+  render(`${header("IVR Analytics", { back: true })}<div class="loading">Loading IVR analytics…</div>`);
+  let a = null;
+  try { a = await api("/ivr/analytics"); } catch (e) { toast(e.message, true); }
+  let health = null;
+  try { health = await api("/ivr/health"); } catch (e) {}
+  render(`
+    ${header("📞 IVR Helpline Analytics", { back: true })}
+    ${a ? `
+    <div class="stat-grid">
+      ${statCard(a.totals.calls, "Total Calls")}
+      ${statCard(a.totals.completed_calls, "Completed")}
+      ${statCard(a.totals.reports, "Reports")}
+      ${statCard(a.totals.high_priority, "High Priority")}
+      ${statCard(a.totals.vet_connections, "Vet Calls")}
+      ${statCard(Math.round(a.totals.resolution_rate || 0) + "%", "Resolved")}
+    </div>
+    <div class="section-card">
+      <div class="section-title">Reports by District</div>${barChart(a.reports_by_district)}
+    </div>
+    <div class="section-card">
+      <div class="section-title">Problem Categories</div>${barChart(a.problem_categories)}
+    </div>
+    <div class="section-card">
+      <div class="section-title">Urgency Distribution</div>${pieChart(a.reports_by_urgency)}
+    </div>
+    <div class="section-card">
+      <div class="section-title">Location Capture Sources</div>${pieChart(a.location_sources)}
+      <div class="meta" style="margin-top:8px">GPS only comes from the farmer's browser consent link; FARMER_PROVIDED comes from the survey; NOT_AVAILABLE is recorded explicitly — never guessed.</div>
+    </div>` : ""}
+    <div class="section-card">
+      <div class="section-title">System Status</div>
+      ${health ? `
+        <div class="detail-grid">
+          <div><b>Telephony</b>${health.configured ? `<span class="badge badge-green">${health.provider}</span>` : `<span class="badge badge-red">not configured</span>`}</div>
+          <div><b>IVR Number</b>${health.ivr_phone_number || "—"}</div>
+          <div><b>Speech-to-Text</b>${health.stt && health.stt.configured ? `<span class="badge badge-green">${health.stt.provider}</span>` : `<span class="badge badge-orange">off</span>`}</div>
+          <div><b>AI Summariser</b>${health.ai && health.ai.configured ? `<span class="badge badge-green">${health.ai.model}</span>` : `<span class="badge badge-orange">deterministic</span>`}</div>
+          <div><b>Languages</b>${(health.languages || []).join(", ").toUpperCase()}</div>
+          <div><b>Worker</b>${health.worker_enabled ? "inline" : "external"}</div>
+        </div>
+        ${(health.errors || []).length ? `<div class="conflict-box" style="margin-top:10px"><b>Provider configuration issues</b>${health.errors.join(" · ")}</div>` : ""}
+      ` : emptyState("Health endpoint unavailable.")}
+    </div>
+    <div class="section-card">
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" onclick="location.hash='#/govt/ivr-reports'">IVR Reports</button>
+        <button class="btn btn-ghost btn-sm" onclick="location.hash='#/govt/ivr/calls'">Call History</button>
+        <button class="btn btn-ghost btn-sm" onclick="location.hash='#/govt/ivr/config'">Configuration</button>
+      </div>
+    </div>
+    ${bottomNav("#/govt/dashboard")}
+  `);
+}, ["govt"]);
+
+route("#/govt/ivr/config", async () => {
+  render(`${header("IVR Configuration", { back: true })}<div class="loading">Loading configuration…</div>`);
+  let cfg = null, survey = null, vets = null;
+  try {
+    cfg = await api("/ivr/config");
+    survey = await api("/ivr/survey");
+    vets = await api("/ivr/vets/availability");
+  } catch (e) { toast(e.message, true); }
+  render(`
+    ${header("⚙️ IVR Configuration", { back: true })}
+    <div class="section-card">
+      <div class="section-title">Channel Settings (administrator)</div>
+      <div class="meta" style="margin-bottom:10px">Secrets (telephony credentials, AI keys, the IVR phone number) are set as environment variables on the deployment and never stored in the database or shown here.</div>
+      <div class="field"><label>Supported languages (comma separated)</label><input id="cfgLangs" value="${(cfg && cfg.supported_languages || []).join(", ")}" /></div>
+      <div class="field"><label>Default language</label><select id="cfgDefaultLang">
+        ${(cfg && cfg.available_locales || ["en"]).map(l => `<option ${l === (cfg.settings.DEFAULT_LANGUAGE) ? "selected" : ""}>${l}</option>`).join("")}
+      </select></div>
+      <div class="form-row">
+        <div class="field"><label>Duplicate window (minutes)</label><input id="cfgDupWindow" type="number" value="${(cfg && cfg.settings.DUPLICATE_WINDOW_MINUTES) || 1440}" /></div>
+        <div class="field"><label>Max input retries</label><input id="cfgRetries" type="number" value="${(cfg && cfg.settings.MAX_RETRIES) || 2}" /></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label>Call recording</label><select id="cfgRecording">
+          <option value="on" ${(cfg && cfg.settings.RECORDING_ENABLED) ? "selected" : ""}>Enabled (consent asked on vet calls)</option>
+          <option value="off" ${!(cfg && cfg.settings.RECORDING_ENABLED) ? "selected" : ""}>Disabled</option>
+        </select></div>
+        <div class="field"><label>Auto-assign veterinarian</label><select id="cfgAssign">
+          <option value="on" ${(cfg && cfg.settings.AUTO_ASSIGN_VET) ? "selected" : ""}>Enabled</option>
+          <option value="off" ${!(cfg && cfg.settings.AUTO_ASSIGN_VET) ? "selected" : ""}>Disabled</option>
+        </select></div>
+      </div>
+      <button class="btn btn-primary" onclick="ivrSaveConfig()">Save Settings</button>
+    </div>
+    <div class="section-card">
+      <div class="subheading">🩺 Veterinarian Availability (IVR)</div>
+      ${((vets && vets.vets || []).length) ? (vets.vets.map(v => `
+        <div class="list-card" style="cursor:default">
+          <div class="row1"><span class="title">${v.full_name}</span>
+          <span class="badge ${v.is_available ? "badge-green" : "badge-red"}">${v.is_available ? "ON DUTY (IVR)" : "OFF DUTY (IVR)"}</span></div>
+          <div class="meta">${v.district || "—"} · ${v.available_from}–${v.available_to} · workload limit ${v.max_open_cases}</div>
+          <div class="btn-row" style="margin-top:8px">
+            <button class="btn btn-outline btn-sm" onclick="ivrToggleVet(${v.id}, ${v.is_available ? "false" : "true"})">${v.is_available ? "Set Off Duty" : "Set On Duty"}</button>
+          </div>
+        </div>`).join("")) : emptyState("No veterinarians found.")}
+    </div>
+    <div class="section-card">
+      <div class="subheading">📋 Survey Definition (version ${survey ? survey.version : "—"})</div>
+      <div class="meta" style="margin-bottom:10px">The question set the IVR asks. Editing it changes the next call immediately. Questions support DTMF options, speech, confirmation and conditional follow-ups.</div>
+      <textarea id="surveyJson" style="width:100%;min-height:260px;font-family:monospace;font-size:11px" spellcheck="false">${survey ? JSON.stringify(survey.definition, null, 1) : ""}</textarea>
+      <div class="btn-row" style="margin-top:10px">
+        <button class="btn btn-primary btn-sm" onclick="ivrSaveSurvey()">Save Survey</button>
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('surveyJson').focus()">Edit</button>
+      </div>
+    </div>
+    ${bottomNav("#/govt/dashboard")}
+  `);
+}, ["govt"]);
+
+window.ivrSaveConfig = async function () {
+  const g = (id) => { const el = document.getElementById(id); return el ? el.value : null; };
+  const overrides = {};
+  if (g("cfgLangs")) overrides.IVR_SUPPORTED_LANGUAGES = g("cfgLangs").split(",").map(x => x.trim()).filter(Boolean);
+  if (g("cfgDefaultLang")) overrides.IVR_DEFAULT_LANGUAGE = g("cfgDefaultLang");
+  if (g("cfgDupWindow")) overrides.IVR_DUPLICATE_WINDOW_MINUTES = Number(g("cfgDupWindow"));
+  if (g("cfgRetries")) overrides.IVR_MAX_RETRIES = Number(g("cfgRetries"));
+  if (g("cfgRecording")) overrides.IVR_RECORDING_ENABLED = g("cfgRecording") === "on";
+  if (g("cfgAssign")) overrides.IVR_AUTO_ASSIGN_VET = g("cfgAssign") === "on";
+  try {
+    const res = await api("/ivr/config", { method: "PUT", body: { overrides } });
+    if (res.rejected && res.rejected.length) toast("Saved. Rejected keys: " + res.rejected.join(", "), true);
+    else toast("IVR configuration saved.");
+  } catch (err) { toast(err.message, true); }
+};
+window.ivrToggleVet = async function (vetId, on) {
+  try {
+    await api(`/ivr/vets/${vetId}/availability`, { method: "PUT", body: { is_available: on ? 1 : 0 } });
+    toast(on ? "Veterinarian set on duty for IVR." : "Veterinarian set off duty for IVR.");
+    router();
+  } catch (err) { toast(err.message, true); }
+};
+window.ivrSaveSurvey = async function () {
+  const el = document.getElementById("surveyJson");
+  try {
+    const definition = JSON.parse(el.value);
+    await api("/ivr/survey", { method: "PUT", body: { definition } });
+    toast("Survey definition saved — live from the next call.");
+    router();
+  } catch (err) { toast("Invalid survey JSON: " + err.message, true); }
 };

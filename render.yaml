@@ -10,6 +10,82 @@ services:
         generateValue: true
       - key: SIH_ML_BACKEND
         sync: false
+      # ---------------------- IVR reporting channel ----------------------
+      # Provider: twilio | exotel | plivo | custom | (empty = unconfigured)
+      - key: IVR_PROVIDER
+        sync: false
+      - key: IVR_PHONE_NUMBER
+        sync: false
+      - key: TELEPHONY_ACCOUNT_ID
+        sync: false
+      - key: TELEPHONY_AUTH_TOKEN
+        sync: false
+      - key: TELEPHONY_API_KEY
+        sync: false
+      - key: TELEPHONY_API_SECRET
+        sync: false
+      - key: TELEPHONY_PHONE_NUMBER
+        sync: false
+      - key: TELEPHONY_SID
+        sync: false
+      - key: TELEPHONY_SUBDOMAIN
+        sync: false
+      - key: TELEPHONY_APP_ID
+        sync: false
+      - key: TELEPHONY_BASE_URL
+        sync: false
+      - key: TELEPHONY_WEBHOOK_SECRET
+        generateValue: true
+      - key: TELEPHONY_MARKUP
+        sync: false
+      # Public URL of THIS service (used to verify signatures + build the
+      # browser GPS consent link), e.g. https://pashu-shield-backend.onrender.com
+      - key: IVR_PUBLIC_BASE_URL
+        sync: false
+      # Security
+      - key: IVR_PHONE_ENCRYPTION_KEY
+        sync: false
+      - key: IVR_PHONE_HASH_SECRET
+        sync: false
+      - key: IVR_LOCATION_TOKEN_SECRET
+        sync: false
+      - key: IVR_REQUIRE_WEBHOOK_SIGNATURE
+        sync: false
+      # Languages & behaviour
+      - key: IVR_SUPPORTED_LANGUAGES
+        sync: false
+      - key: IVR_DEFAULT_LANGUAGE
+        sync: false
+      - key: IVR_RECORDING_ENABLED
+        sync: false
+      - key: IVR_RECORDING_CONSENT_REQUIRED
+        sync: false
+      - key: IVR_NOTIFY_GOV_USERS
+        sync: false
+      - key: IVR_AUTO_ASSIGN_VET
+        sync: false
+      # Speech-to-text / AI summarisation
+      - key: IVR_STT_PROVIDER
+        sync: false
+      - key: IVR_STT_WHISPER_URL
+        sync: false
+      - key: IVR_STT_BASE_URL
+        sync: false
+      - key: IVR_STT_API_KEY
+        sync: false
+      - key: IVR_STT_MODEL
+        sync: false
+      - key: IVR_AI_PROVIDER
+        sync: false
+      - key: IVR_AI_BASE_URL
+        sync: false
+      - key: IVR_AI_API_KEY
+        sync: false
+      - key: IVR_AI_MODEL
+        sync: false
+      # When an external worker is deployed, keep the in-process worker off:
+      - key: IVR_DISABLE_INLINE_WORKER
+        sync: false
 
   - type: web
     name: pashu-shield-ml
@@ -17,3 +93,57 @@ services:
     rootDir: ml-backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+  # Background worker: transcribes calls, generates structured AI summaries,
+  # creates the reports and sends notifications AFTER the call ends, so the
+  # farmer never waits on the line. Requires the same telephony/AI env vars
+  # as the backend (sync: false -> configure them in the Render dashboard).
+  - type: worker
+    name: pashu-shield-ivr-worker
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m ivr.worker
+    envVars:
+      - key: IVR_PROVIDER
+        sync: false
+      - key: TELEPHONY_ACCOUNT_ID
+        sync: false
+      - key: TELEPHONY_AUTH_TOKEN
+        sync: false
+      - key: TELEPHONY_API_KEY
+        sync: false
+      - key: TELEPHONY_API_SECRET
+        sync: false
+      - key: TELEPHONY_PHONE_NUMBER
+        sync: false
+      - key: TELEPHONY_SID
+        sync: false
+      - key: TELEPHONY_SUBDOMAIN
+        sync: false
+      - key: TELEPHONY_BASE_URL
+        sync: false
+      - key: IVR_PUBLIC_BASE_URL
+        sync: false
+      - key: IVR_PHONE_ENCRYPTION_KEY
+        sync: false
+      - key: IVR_PHONE_HASH_SECRET
+        sync: false
+      - key: IVR_STT_PROVIDER
+        sync: false
+      - key: IVR_STT_WHISPER_URL
+        sync: false
+      - key: IVR_STT_BASE_URL
+        sync: false
+      - key: IVR_STT_API_KEY
+        sync: false
+      - key: IVR_AI_PROVIDER
+        sync: false
+      - key: IVR_AI_BASE_URL
+        sync: false
+      - key: IVR_AI_API_KEY
+        sync: false
+      - key: IVR_AI_MODEL
+        sync: false
+      - key: SIH_SECRET_KEY
+        generateValue: true

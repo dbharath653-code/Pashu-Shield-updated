@@ -3,6 +3,7 @@ import json
 import math
 import uuid
 import jwt
+import secrets
 import sqlite3
 import requests
 import io
@@ -22,6 +23,16 @@ from database import (
 )
 import weather
 import animal_ai
+
+# ------------------------------------------------- IVR reporting channel ---
+# Additive: the IVR channel reuses the existing users / animals / cases /
+# notifications / audit infrastructure. It is mounted only when it imports
+# cleanly, so a problem in the IVR package can never break the web app.
+from ivr.routes import create_ivr_blueprint
+from ivr import jobs as ivr_jobs
+from ivr import report_service as ivr_report_service
+from ivr.config import load_db_overrides, settings as ivr_settings
+import database
 
 SECRET_KEY = os.environ.get("SIH_SECRET_KEY", "sih-hackathon-dev-secret-change-me")
 TOKEN_EXP_HOURS = 12
@@ -882,6 +893,18 @@ def update_case(case_id):
     audit_log(conn, "UPDATE_CASE", "case", case_id, actor_id=g.user["uid"],
               actor_name=g.user["name"], actor_role=g.user["role"],
               details={"status": new_status, "diagnosis": diagnosis})
+
+    # Keep the IVR report lifecycle in step with the existing case workflow.
+    try:
+        ivr_report_service.sync_case_status(
+            conn, case_id, new_status,
+            context={"notify": notify, "audit_log": audit_log, "hash_password": hash_password,
+                     "get_db": get_db},
+            actor_name=g.user["name"], actor_role=g.user["role"],
+        )
+    except Exception as exc:  # pragma: no cover - never break case updates
+        print(f"[ivr] status sync skipped: {exc}")
+
     conn.commit()
     updated = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
     conn.close()
@@ -2681,6 +2704,51 @@ def sync_queue():
     conn.commit()
     conn.close()
     return jsonify({"synced_count": len([r for r in results if r["status"] == "success"]), "results": results})
+
+
+# ==========================================================================
+# IVR reporting channel - mounted additively on the existing application.
+# ==========================================================================
+def _mount_ivr():
+    """Create IVR tables, load admin overrides and register the blueprint."""
+    from ivr.providers import get_provider
+    from ivr.schema import ensure_ivr_schema
+    from ivr.survey import ensure_default_survey
+    from ivr.rules import ensure_vet_availability
+
+    # Never create the database file before the core schema exists: a fresh
+    # deployment must go through init_db() so the seed data is installed.
+    try:
+        if os.path.exists(database.DB_PATH):
+            conn = get_db()
+            ensure_ivr_schema(conn)
+            ensure_default_survey(conn)
+            ensure_vet_availability(conn)
+            conn.commit()
+            conn.close()
+    except Exception as exc:  # pragma: no cover - never break the web app
+        print(f"[ivr] schema bootstrap skipped: {exc}")
+
+    load_db_overrides(get_db)
+
+    context = {
+        "notify": notify,
+        "audit_log": audit_log,
+        "hash_password": hash_password,
+        "auth_required": auth_required,
+        "get_db": get_db,
+        "provider": get_provider(),
+    }
+    app.register_blueprint(create_ivr_blueprint(context))
+
+    if ivr_settings.WORKER_ENABLED and os.environ.get("IVR_DISABLE_INLINE_WORKER") != "1":
+        try:
+            ivr_jobs.start_workers(get_db, context=context)
+        except Exception as exc:  # pragma: no cover
+            print(f"[ivr] inline worker not started: {exc}")
+
+
+_mount_ivr()
 
 
 if __name__ == "__main__":
