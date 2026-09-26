@@ -1106,6 +1106,10 @@ def update_case_location(case_id):
     if not case or not _can_access_case(conn, case):
         conn.close(); return jsonify({"error": "Case not found or not authorized"}), 404
     data = request.get_json(force=True) or {}
+    # A report location is a submission-time snapshot, not a live/current
+    # position. Once captured, it must remain attached to this case.
+    if conn.execute("SELECT 1 FROM case_locations WHERE case_id=? LIMIT 1", (case_id,)).fetchone():
+        conn.close(); return jsonify({"error": "report location is immutable once captured"}), 409
     try:
         _record_case_location(conn, case_id, data, g.user["uid"], default_source="GPS")
     except (TypeError, ValueError) as exc:
@@ -1222,7 +1226,7 @@ def _case_location(conn, case_id):
     return dict(row) if row else None
 
 
-def _visit_response(conn, visit_id, include_history=False):
+def _visit_response(conn, visit_id, include_history=False, include_vet_location=False):
     visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit_id,)).fetchone()
     if not visit:
         return None
@@ -1237,11 +1241,19 @@ def _visit_response(conn, visit_id, include_history=False):
     latest = conn.execute(
         "SELECT * FROM visit_locations WHERE visit_id=? ORDER BY captured_at DESC, id DESC LIMIT 1", (visit_id,)
     ).fetchone()
-    out["latest_location"] = dict(latest) if latest else None
-    if include_history:
-        out["location_history"] = [dict(r) for r in conn.execute(
-            "SELECT * FROM visit_locations WHERE visit_id=? ORDER BY captured_at ASC, id ASC", (visit_id,)
-        ).fetchall()]
+    # Veterinarian GPS is private. It is only returned to the veterinarian
+    # who owns this visit; farmer and government clients must not receive it.
+    if include_vet_location:
+        out["latest_location"] = dict(latest) if latest else None
+        if include_history:
+            out["location_history"] = [dict(r) for r in conn.execute(
+                "SELECT * FROM visit_locations WHERE visit_id=? ORDER BY captured_at ASC, id ASC", (visit_id,)
+            ).fetchall()]
+    else:
+        out["latest_location"] = None
+        # Visit routing origin is also veterinarian location data.
+        out["from_lat"] = None
+        out["from_lng"] = None
     return out
 
 
@@ -1488,7 +1500,7 @@ def get_visit_location(visit_id):
     case = _case_for_visit(conn, visit["case_id"])
     if not _can_access_case(conn, case, allow_govt=True):
         conn.close(); return jsonify({"error": "Not authorized to view this location"}), 403
-    result = _visit_response(conn, visit_id, include_history=(g.user["role"] in ("vet", "govt")))
+    result = _visit_response(conn, visit_id, include_history=(g.user["role"] == "vet"), include_vet_location=(g.user["role"] == "vet" and visit["vet_id"] == g.user["uid"]))
     conn.close(); return jsonify(result)
 
 
@@ -1502,7 +1514,7 @@ def track_visit(case_id):
     visit = conn.execute("SELECT id FROM case_visits WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)).fetchone()
     if not visit:
         conn.close(); return jsonify({"visit": None, "location_status": "NOT_STARTED", "current_position": None})
-    result = _visit_response(conn, visit["id"], include_history=False)
+    result = _visit_response(conn, visit["id"], include_history=False, include_vet_location=(g.user["role"] == "vet" and visit["vet_id"] == g.user["uid"]))
     result["visit"] = {k: result.get(k) for k in ("id", "case_id", "vet_id", "status", "started_at", "arrived_at", "completed_at", "from_lat", "from_lng", "to_lat", "to_lng", "travel_seconds")}
     vet = conn.execute("SELECT full_name,mobile,specialization FROM users WHERE id=?", (result.get("vet_id"),)).fetchone()
     result["vet"] = dict(vet) if vet else None
