@@ -147,6 +147,9 @@ CREATE TABLE IF NOT EXISTS lab_reports (
     abnormal_flag TEXT DEFAULT 'Normal',
     technician_name TEXT,
     verification_status TEXT DEFAULT 'UNVERIFIED',
+    current_status TEXT DEFAULT 'RESULT_PENDING',
+    report_generated_at TEXT,
+    last_updated_at TEXT,
     verified_by INTEGER REFERENCES users(id),
     verified_at TEXT,
     comments TEXT,
@@ -194,6 +197,15 @@ CREATE TABLE IF NOT EXISTS notifications (
     message TEXT NOT NULL,
     type TEXT DEFAULT 'info',
     is_read INTEGER DEFAULT 0,
+    event_id TEXT,
+    idempotency_key TEXT,
+    recipient_role TEXT,
+    channel TEXT DEFAULT 'in_app',
+    delivery_status TEXT DEFAULT 'DELIVERED',
+    retry_count INTEGER DEFAULT 0,
+    error_info TEXT,
+    case_id INTEGER REFERENCES cases(id),
+    data_json TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -443,6 +455,78 @@ CREATE TABLE IF NOT EXISTS offline_sync_log (
     synced_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Case locations are explicit observations. NULL coordinates mean that no
+-- GPS was received; village/district text is not silently converted to GPS.
+CREATE TABLE IF NOT EXISTS case_locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    source TEXT NOT NULL CHECK(source IN ('GPS','NETWORK','FARMER_PROVIDED','PROFILE','MANUAL','NOT_AVAILABLE')),
+    latitude REAL,
+    longitude REAL,
+    accuracy_m REAL,
+    village TEXT,
+    block TEXT,
+    district TEXT,
+    state TEXT,
+    captured_by INTEGER REFERENCES users(id),
+    captured_at TEXT DEFAULT (datetime('now')),
+    is_current INTEGER DEFAULT 1,
+    CHECK((latitude IS NULL AND longitude IS NULL) OR (latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180))
+);
+
+CREATE TABLE IF NOT EXISTS visit_tracking_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    visit_id INTEGER NOT NULL REFERENCES case_visits(id) ON DELETE CASCADE,
+    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    vet_id INTEGER NOT NULL REFERENCES users(id),
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','STOPPED','EXPIRED')),
+    started_at TEXT DEFAULT (datetime('now')),
+    stopped_at TEXT,
+    expires_at TEXT NOT NULL,
+    stop_reason TEXT,
+    UNIQUE(visit_id, status)
+);
+
+CREATE TABLE IF NOT EXISTS visit_locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tracking_session_id INTEGER NOT NULL REFERENCES visit_tracking_sessions(id) ON DELETE CASCADE,
+    visit_id INTEGER NOT NULL REFERENCES case_visits(id) ON DELETE CASCADE,
+    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    vet_id INTEGER NOT NULL REFERENCES users(id),
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL,
+    accuracy_m REAL,
+    speed_mps REAL,
+    heading_deg REAL,
+    captured_at TEXT NOT NULL,
+    received_at TEXT DEFAULT (datetime('now')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    CHECK(latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)
+);
+
+CREATE TABLE IF NOT EXISTS lab_report_status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES lab_reports(id) ON DELETE CASCADE,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    actor_id INTEGER REFERENCES users(id),
+    actor_role TEXT,
+    note TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS realtime_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    case_id INTEGER REFERENCES cases(id),
+    actor_id INTEGER REFERENCES users(id),
+    actor_role TEXT,
+    payload TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    idempotency_key TEXT UNIQUE
+);
+
 -- Indexes for high performance
 CREATE INDEX IF NOT EXISTS idx_animal_qr_token ON animal_qr_codes(qr_token);
 CREATE INDEX IF NOT EXISTS idx_animal_qr_animal ON animal_qr_codes(animal_id);
@@ -457,6 +541,20 @@ CREATE INDEX IF NOT EXISTS idx_medication_animal ON animal_medications(animal_id
 CREATE INDEX IF NOT EXISTS idx_treatment_case ON treatment_responses(case_id);
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
+CREATE INDEX IF NOT EXISTS idx_case_locations_case ON case_locations(case_id, captured_at);
+CREATE INDEX IF NOT EXISTS idx_case_locations_geo ON case_locations(latitude, longitude);
+CREATE INDEX IF NOT EXISTS idx_tracking_case ON visit_tracking_sessions(case_id, status);
+CREATE INDEX IF NOT EXISTS idx_tracking_vet ON visit_tracking_sessions(vet_id, status);
+CREATE INDEX IF NOT EXISTS idx_visit_locations_case ON visit_locations(case_id, captured_at);
+CREATE INDEX IF NOT EXISTS idx_visit_locations_vet ON visit_locations(vet_id, captured_at);
+CREATE INDEX IF NOT EXISTS idx_lab_history_report ON lab_report_status_history(report_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_realtime_created ON realtime_events(created_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_realtime_case ON realtime_events(case_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cases_owner ON cases(owner_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cases_vet ON cases(vet_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_lab_reports_case ON lab_reports(case_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_lab_reports_entered ON lab_reports(entered_by, created_at);
 CREATE INDEX IF NOT EXISTS idx_weather_dist ON weather_observations(district, fetched_at);
 """
 
@@ -792,6 +890,10 @@ def ensure_new_columns(conn):
     lr_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lab_reports)").fetchall()}
     lr_needed = {
         "sample_id": "INTEGER",
+        "current_status": "TEXT DEFAULT 'RESULT_PENDING'",
+        "priority": "TEXT DEFAULT 'Normal'",
+        "report_generated_at": "TEXT",
+        "last_updated_at": "TEXT",
         "test_type": "TEXT",
         "test_method": "TEXT",
         "quantitative_result": "REAL",
@@ -830,6 +932,27 @@ def ensure_new_columns(conn):
     h_cols = {row["name"] for row in conn.execute("PRAGMA table_info(herds)").fetchall()}
     if "state" not in h_cols:
         conn.execute("ALTER TABLE herds ADD COLUMN state TEXT DEFAULT 'Maharashtra'")
+
+    # notification columns (additive migration for older installations)
+    n_cols = {row["name"] for row in conn.execute("PRAGMA table_info(notifications)").fetchall()}
+    n_needed = {
+        "event_id": "TEXT", "idempotency_key": "TEXT", "recipient_role": "TEXT",
+        "channel": "TEXT DEFAULT 'in_app'", "delivery_status": "TEXT DEFAULT 'DELIVERED'",
+        "retry_count": "INTEGER DEFAULT 0", "error_info": "TEXT", "case_id": "INTEGER",
+        "data_json": "TEXT",
+    }
+    for col, col_t in n_needed.items():
+        if col not in n_cols:
+            conn.execute(f"ALTER TABLE notifications ADD COLUMN {col} {col_t}")
+    # These indexes must be created after additive columns so upgrades of an
+    # older database do not fail while executing the base schema.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_event ON notifications(event_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_idempotency ON notifications(idempotency_key)")
+
+    # report/visit migrations are intentionally additive; existing records stay
+    # readable and are assigned a conservative pending status.
+    conn.execute("UPDATE lab_reports SET current_status=COALESCE(current_status, CASE WHEN verification_status='VERIFIED' THEN 'REPORT_SENT_TO_VET' ELSE 'RESULT_PENDING' END) WHERE current_status IS NULL")
+    conn.execute("UPDATE lab_reports SET last_updated_at=COALESCE(last_updated_at, created_at) WHERE last_updated_at IS NULL")
 
     # users columns (helpline: saved language + vet availability override)
     u_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}

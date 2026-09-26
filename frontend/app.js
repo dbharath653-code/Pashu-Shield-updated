@@ -2,7 +2,7 @@
 // PashuMitra — Animal Disease Management & Surveillance Platform
 // Integrated Pashu Health Chain:
 // 1. Animal Health Identity (QR, Passport, Reproductive, Medication & Allergies)
-// 2. Digital Biological Sample Tracking (GPS, Time, Chain of Custody)
+// 2. Biological sample identity & chain of custody (processing workflow)
 // 3. Laboratory Diagnostic Portal (Receiving, Acceptance, Testing, Reports)
 // 4. Veterinary Decision Support & AI Clinical Guidance
 // 5. Structured Treatment Responses & Farm-Level Intelligence
@@ -68,8 +68,13 @@ const I18N = {
     "lang.label": "भाषा",
   },
 };
+// The IVR and web portal share the same supported language codes. The complete
+// IVR dictionaries live under backend/ivr/locales; portal strings use English
+// fallback for keys not yet translated instead of rendering a raw key.
+I18N.hi = { ...I18N.en, "app.tagline": "पशु रोग रिपोर्टिंग और पशु चिकित्सा सेवा", "nav.dashboard": "मुख्यपृष्ठ", "nav.cases": "मामले", "nav.reports": "रिपोर्ट", "nav.lab": "प्रयोगशाला", "nav.alerts": "सूचनाएं", "role.owner": "पशु मालिक", "role.vet": "पशु चिकित्सक", "role.govt": "सरकारी अधिकारी", "role.lab": "प्रयोगशाला कर्मचारी", "btn.login": "लॉगिन", "btn.register": "पंजीकरण", "btn.logout": "लॉग आउट", "lang.label": "भाषा" };
+I18N.te = { ...I18N.en, "app.tagline": "పశు వ్యాధి నివేదికలు మరియు పశువైద్య సేవ", "nav.dashboard": "హోమ్", "nav.cases": "కేసులు", "nav.reports": "నివేదికలు", "nav.lab": "ప్రయోగశాల", "nav.alerts": "సూచనలు", "role.owner": "పశు యజమాని", "role.vet": "పశువైద్యుడు", "role.govt": "ప్రభుత్వ అధికారి", "role.lab": "ప్రయోగశాల సిబ్బంది", "btn.login": "లాగిన్", "btn.register": "నమోదు", "btn.logout": "లాగ్ అవుట్", "lang.label": "భాష" };
 function t(key) {
-  return (I18N[state.lang] && I18N[state.lang][key]) || I18N.en[key] || key;
+  return (I18N[state.lang] && I18N[state.lang][key]) || I18N.en[key] || "Translation unavailable";
 }
 window.setLang = function (lang) {
   state.lang = lang;
@@ -81,6 +86,8 @@ function langToggle() {
     <span>${t("lang.label")}:</span>
     <button type="button" class="${state.lang === "en" ? "active" : ""}" onclick="setLang('en')">English</button>
     <button type="button" class="${state.lang === "mr" ? "active" : ""}" onclick="setLang('mr')">मराठी</button>
+    <button type="button" class="${state.lang === "hi" ? "active" : ""}" onclick="setLang('hi')">हिन्दी</button>
+    <button type="button" class="${state.lang === "te" ? "active" : ""}" onclick="setLang('te')">తెలుగు</button>
   </div>`;
 }
 
@@ -133,6 +140,39 @@ async function syncOfflineQueue() {
 window.syncOfflineQueue = syncOfflineQueue;
 window.addEventListener("online", syncOfflineQueue);
 
+// Authenticated database-backed realtime stream. EventSource cannot set
+// Authorization headers, so it receives a short-lived, purpose-bound token
+// minted by the backend instead of the long-lived API JWT.
+let realtimeSource = null;
+let realtimeStarting = false;
+let realtimeReconnectTimer = null;
+async function startRealtimeStream() {
+  if (!state.token || !window.EventSource || realtimeStarting) return;
+  if (realtimeSource) realtimeSource.close();
+  realtimeStarting = true;
+  try {
+    const tokenRes = await fetch(API + "/realtime/token", { headers: { Authorization: "Bearer " + state.token } });
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok || !tokenData.token) throw new Error(tokenData.error || "Realtime token unavailable");
+    const url = `${API}/realtime/stream?access_token=${encodeURIComponent(tokenData.token)}`;
+    realtimeSource = new EventSource(url);
+    realtimeSource.onopen = () => { state.realtime = "connected"; };
+    realtimeSource.onerror = () => {
+      state.realtime = "reconnecting";
+      if (realtimeSource) realtimeSource.close();
+      clearTimeout(realtimeReconnectTimer);
+      realtimeReconnectTimer = setTimeout(() => startRealtimeStream(), 2500);
+    };
+    const refresh = (ev) => {
+      try { const payload = JSON.parse(ev.data || "{}"); if (payload.event_type === "VET_LOCATION_UPDATED" || payload.event_type.startsWith("LAB_") || payload.event_type === "CASE_CREATED" || payload.event_type === "VET_STARTED_VISIT") { if (state.route.includes("lab-reports") || state.route.includes("lab-tracking") || state.route.includes("cases/")) router(); } } catch (_) {}
+    };
+    ["CASE_CREATED", "VET_STARTED_VISIT", "VET_LOCATION_UPDATED", "TRACKING_STARTED", "TRACKING_STOPPED", "VET_ARRIVED", "VISIT_COMPLETED", "LAB_SAMPLE_RECEIVED", "LAB_TEST_STARTED", "LAB_RESULT_READY", "LAB_REPORT_SUBMITTED", "LAB_REPORT_STATUS_UPDATED", "HELPLINE_LOCATION_UPDATED"].forEach(name => realtimeSource.addEventListener(name, refresh));
+  } catch (_) { state.realtime = "reconnecting"; }
+  finally { realtimeStarting = false; }
+}
+function stopRealtimeStream() { clearTimeout(realtimeReconnectTimer); if (realtimeSource) realtimeSource.close(); realtimeSource = null; }
+window.addEventListener("beforeunload", stopRealtimeStream);
+
 async function api(path, { method = "GET", body } = {}) {
   const doCall = async (withQueryToken) => {
     const headers = { "Content-Type": "application/json" };
@@ -177,6 +217,7 @@ function setAuth(token, user) {
   state.token = token; state.user = user;
   localStorage.setItem("token", token);
   localStorage.setItem("user", JSON.stringify(user));
+  startRealtimeStream();
 }
 
 function logout(silent) {
@@ -195,8 +236,8 @@ function fmtDate(d) {
 function statusBadgeClass(status) {
   const s = (status || "").toUpperCase();
   if (["NEW", "ASSIGNED", "UNDER INVESTIGATION", "REJECTED"].includes(s)) return "badge-red";
-  if (["SAMPLE COLLECTED", "LAB PENDING", "DIAGNOSED", "TREATMENT", "FOLLOW-UP", "READY_FOR_PICKUP", "PICKED_UP", "IN_TRANSIT", "ARRIVED_AT_LAB", "LAB_RECEIVED", "TESTING", "RESULT_READY"].includes(s)) return "badge-orange";
-  if (["RECOVERED", "CLOSED", "COMPLETED", "VERIFIED"].includes(s)) return "badge-green";
+  if (["SAMPLE COLLECTED", "LAB PENDING", "DIAGNOSED", "TREATMENT", "FOLLOW-UP", "READY_FOR_PICKUP", "PICKED_UP", "IN_TRANSIT", "ARRIVED_AT_LAB", "LAB_RECEIVED", "TESTING", "RESULT_READY", "SAMPLE_IN_TRANSIT", "RECEIVED_BY_LAB", "RESULT_PENDING", "REPORT_REVIEWED", "VET_ACTION_REQUIRED", "ON_THE_WAY", "PREPARING", "DELAYED"].includes(s)) return "badge-orange";
+  if (["RECOVERED", "CLOSED", "COMPLETED", "VERIFIED", "SAMPLE_COLLECTED", "REPORT_SENT_TO_VET", "CASE_RESOLVED", "ARRIVED", "CONSULTATION_STARTED"].includes(s)) return "badge-green";
   return "badge-blue";
 }
 function severityBadgeClass(sev) {
@@ -220,6 +261,7 @@ function header(title, opts = {}) {
   const notifHref = role ? `#/${role}/notifications` : "#/";
   const profileHref = role ? `#/${role}/profile` : "#/";
   const qCount = getOfflineQueue().length;
+  const realtimeLabel = state.realtime === "connected" ? "🟢 Live" : state.realtime === "reconnecting" ? "🟠 Reconnecting" : "⚪ Live unavailable";
   return `
   <div class="app-header">
     ${opts.back ? `<button class="header-icon-btn" onclick="history.back()">←</button>`
@@ -230,6 +272,7 @@ function header(title, opts = {}) {
       <button class="header-icon-btn" onclick="location.hash='${profileHref}'" title="Profile & Settings">👤</button>
     </div>
   </div>
+  <div style="text-align:center;margin-top:6px"><span class="small-muted" title="Authenticated server event stream">${realtimeLabel}</span></div>
   ${qCount > 0 ? `
     <div style="text-align:center;margin-top:6px">
       <span class="sync-indicator" onclick="syncOfflineQueue()">⚡ ${qCount} action(s) queued offline · Tap to sync</span>
@@ -322,8 +365,10 @@ function isPublic(path) {
 }
 
 async function router() {
+  if (state.token && !realtimeSource) startRealtimeStream();
   const hash = location.hash || "#/";
   const [path, query] = hash.split("?");
+  state.route = path;
   const params = Object.fromEntries(new URLSearchParams(query || ""));
 
   // Not logged in -> only public routes allowed
@@ -648,7 +693,7 @@ async function vetDashboard() {
         ${iconItem("📷", "Scan QR", "#/scan")}
         ${iconItem("📋", "User Reports", "#/vet/reports")}
         ${iconItem("🩺", "All Cases", "#/vet/cases")}
-        ${iconItem("🧪", "Lab Reports", "#/vet/lab-reports")}
+        ${iconItem("🧪", "Laboratory Reports / Tracking", "#/vet/lab-reports")}
         ${iconItem("🔍", "Search Herd/Animal", "#/vet/search")}
         ${iconItem("💉", "Record Vaccination", "#/vet/vaccination/new")}
         ${iconItem("🗓️", "Vax Campaigns", "#/vet/campaigns")}
@@ -2139,6 +2184,15 @@ route("#/owner/report", async ({ animal, voice }) => {
     try {
       const body = Object.fromEntries(new FormData(e.target));
       if (voice) body.reported_through = "Voice App";
+      // Location is an explicit farmer permission flow. If permission is
+      // denied or times out, continue the emergency report without coordinates.
+      if (navigator.geolocation) {
+        try {
+          const pos = await new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 3500, maximumAge: 30000 }));
+          body.lat = pos.coords.latitude; body.lng = pos.coords.longitude;
+          body.accuracy = pos.coords.accuracy; body.source = "GPS";
+        } catch (_) { body.source = "NOT_AVAILABLE"; }
+      } else body.source = "NOT_AVAILABLE";
       const c = await api("/cases", { method: "POST", body });
       toast(`Report placed: ${c.case_no}`);
       location.hash = `#/owner/cases/${c.id}`;
@@ -2489,7 +2543,7 @@ window.captureSampleGps = function() {
       txt.textContent = `🟢 GPS Captured: ${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`;
     },
     err => {
-      txt.textContent = "⚠️ GPS permission denied. Using district centroid fallback.";
+      txt.textContent = "⚠️ GPS permission denied. Location will remain unavailable until you provide a real position.";
       document.getElementById("inpSampleManual").value = "1";
     },
     { timeout: 8000 }
@@ -2497,67 +2551,92 @@ window.captureSampleGps = function() {
 };
 
 // ============================ LIVE FIELD-VISIT TRACKING ===================
-let trackTimer = null, trackMap = null, trackVet = null, trackLine = null, trackCtx = null;
+let trackTimer = null, trackMap = null, trackVet = null;
+let visitLocationWatch = null;
 
 function trackStages(t) {
   const s = t.visit ? t.visit.status : null;
-  const onWay = s === "ON_THE_WAY";
-  const arrived = s === "ARRIVED" || s === "COMPLETED";
   const completed = s === "COMPLETED";
+  const arrived = ["ARRIVED", "CONSULTATION_STARTED", "COMPLETED"].includes(s);
+  const onWay = ["PREPARING", "ON_THE_WAY", "NEARBY", "DELAYED"].includes(s);
   return [
-    ["📝 Report placed", "badge-green"],
-    ["✅ Vet accepted", s ? "badge-green" : "badge-blue"],
-    ["🚗 On the way", onWay ? "badge-orange" : arrived || completed ? "badge-green" : "badge-blue"],
-    ["📍 Arrived", arrived ? "badge-green" : "badge-blue"],
-    ["💊 Visit done", completed ? "badge-green" : "badge-blue"],
+    ["Assigned", s ? "badge-green" : "badge-blue"],
+    ["Accepted", s && s !== "ASSIGNED" ? "badge-green" : "badge-blue"],
+    ["Preparing / on the way", onWay ? "badge-orange" : arrived || completed ? "badge-green" : "badge-blue"],
+    ["Arrived", arrived ? "badge-green" : "badge-blue"],
+    ["Consultation completed", completed ? "badge-green" : "badge-blue"],
   ];
 }
 
 function trackingCardHTML(t, c, role) {
   const stages = trackStages(t);
   const v = t.visit;
+  const hasVetLocation = !!t.current_position;
+  const hasFarmerLocation = !!t.destination;
   return `
     <div class="section-card">
-      <div class="subheading">🚗 Live Field-Visit Tracking</div>
+      <div class="subheading">🚗 Veterinary Visit</div>
       <div class="tag-row" style="margin-bottom:12px">
         ${stages.map(([lbl, cls]) => `<span class="badge ${cls}">${lbl}</span>`).join("")}
       </div>
-      <div id="trackMap" style="height:240px;width:100%;border-radius:14px;overflow:hidden;background:#e5e5e5"></div>
+      <div id="trackMap" style="height:240px;width:100%;border-radius:14px;overflow:hidden;background:#eef0f6">
+        <div style="padding:24px;text-align:center;color:#6b708a">${hasVetLocation ? "Loading live map…" : "Veterinarian GPS has not been received yet. No position is being simulated."}</div>
+      </div>
       ${v ? `
         <div class="row1" style="margin-top:10px;font-size:13px">
-          <div><b>ETA:</b> ${v.status === "ON_THE_WAY" ? `${Math.ceil(t.eta_seconds / 60)} mins` : v.status === "ARRIVED" ? "Arrived" : "Completed"}</div>
+          <div><b>Status:</b> ${v.status || "—"}</div>
           <div><b>Veterinarian:</b> ${t.vet ? t.vet.full_name : "Assigned"}</div>
         </div>
+        <div class="meta">${hasVetLocation ? `Last location update: ${fmtDate(t.current_position.captured_at)} · Accuracy: ${t.current_position.accuracy_m || "—"} m` : "Last location update: unavailable"}</div>
+        <div class="meta">${hasFarmerLocation ? "Farmer location is available for this case." : "Farmer GPS is unavailable; village/district text is retained without map coordinates."}</div>
       ` : ""}
-      ${role === "vet" ? visitControlButtons(v) : ""}
+      ${role === "vet" ? visitControlButtons(v, t) : ""}
     </div>`;
 }
 
-function visitControlButtons(v) {
-  if (!v) return `<button class="btn btn-primary" style="margin-top:10px" id="btnStartTrip">🚗 Start Field Visit (I'm on the way)</button>`;
-  if (v.status === "ON_THE_WAY") return `<button class="btn btn-primary" style="margin-top:10px" id="btnArrived">📍 Mark Arrived at Farm</button>`;
-  if (v.status === "ARRIVED") return `<button class="btn btn-primary" style="margin-top:10px" id="btnCompleteTrip">💊 Complete Physical Visit</button>`;
+function visitControlButtons(v, t) {
+  if (!v) return `<button class="btn btn-primary" style="margin-top:10px" id="btnStartTrip">✅ Accept &amp; start visit</button>`;
+  if (["ASSIGNED", "PREPARING"].includes(v.status)) return `<button class="btn btn-primary" style="margin-top:10px" id="btnStartTracking">📍 Start secure GPS sharing</button>`;
+  if (["ON_THE_WAY", "NEARBY", "DELAYED"].includes(v.status)) return `<div class="btn-row" style="margin-top:10px">${t?.tracking?.status !== "ACTIVE" ? '<button class="btn btn-primary" id="btnStartTracking">📍 Start secure GPS sharing</button>' : ''}<button class="btn btn-primary" id="btnArrived">📍 Mark arrived</button>${t?.tracking?.status === "ACTIVE" ? '<button class="btn btn-outline" id="btnStopTracking">Stop sharing</button>' : ''}</div>`;
+  if (v.status === "ARRIVED") return `<button class="btn btn-primary" style="margin-top:10px" id="btnCompleteTrip">💊 Start / complete consultation</button>`;
   return "";
 }
 
 function initTrackMap(t) {
   if (typeof L === "undefined") return;
   const el = document.getElementById("trackMap");
-  if (!el) return;
+  if (!el || !t.destination) return;
   if (trackMap) { trackMap.remove(); trackMap = null; }
   const cur = t.current_position || t.destination;
   trackMap = L.map("trackMap").setView([cur.lat, cur.lng], 13);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 18 }).addTo(trackMap);
-  L.marker([t.destination.lat, t.destination.lng]).addTo(trackMap).bindTooltip("📍 Animal Location");
-  if (t.origin) L.marker([t.origin.lat, t.origin.lng]).addTo(trackMap).bindTooltip("Dispensary");
-  trackVet = L.circleMarker([cur.lat, cur.lng], { radius: 9, color: "#2f6fed", fillColor: "#2f6fed", fillOpacity: 0.9 }).addTo(trackMap);
-  if (t.origin && t.destination) trackLine = L.polyline([[t.origin.lat, t.origin.lng], [t.destination.lat, t.destination.lng]], { color: "#2f6fed", dashArray: "5, 8" }).addTo(trackMap);
+  L.tileLayer(window.MAP_TILE_URL || "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 18 }).addTo(trackMap);
+  L.marker([t.destination.lat, t.destination.lng]).addTo(trackMap).bindTooltip("📍 Farmer location");
+  if (t.current_position) {
+    trackVet = L.circleMarker([cur.lat, cur.lng], { radius: 9, color: "#2f6fed", fillColor: "#2f6fed", fillOpacity: 0.9 }).addTo(trackMap).bindTooltip("🩺 Veterinarian GPS");
+  }
 }
 
 function updateTrackMap(t) {
-  if (!trackMap || !trackVet) return;
-  const cur = t.current_position;
-  trackVet.setLatLng([cur.lat, cur.lng]);
+  if (!trackMap || !t.current_position) return;
+  if (trackVet) trackVet.setLatLng([t.current_position.lat, t.current_position.lng]);
+}
+
+function stopVetLocationWatch() {
+  if (visitLocationWatch !== null && navigator.geolocation) navigator.geolocation.clearWatch(visitLocationWatch);
+  visitLocationWatch = null;
+}
+function startVetLocationWatch(visitId) {
+  stopVetLocationWatch();
+  if (!navigator.geolocation) { toast("This device does not support GPS; tracking remains unavailable.", true); return; }
+  visitLocationWatch = navigator.geolocation.watchPosition(async (pos) => {
+    try {
+      await api(`/visits/${visitId}/location`, { method: "POST", body: {
+        latitude: pos.coords.latitude, longitude: pos.coords.longitude,
+        accuracy: pos.coords.accuracy, speed: pos.coords.speed, heading: pos.coords.heading,
+        timestamp: new Date(pos.timestamp).toISOString(), idempotency_key: `gps:${visitId}:${pos.timestamp}`
+      }});
+    } catch (e) { if (e.status !== 409) toast("GPS update failed: " + e.message, true); }
+  }, (err) => toast(`GPS unavailable (${err.message}). Sharing is paused; no location is shown.`, true), { enableHighAccuracy: true, maximumAge: 10000, timeout: 15000 });
 }
 
 async function loadTracking(c, role) {
@@ -2567,37 +2646,35 @@ async function loadTracking(c, role) {
     const t = await api(`/cases/${c.id}/track`);
     wrap.innerHTML = trackingCardHTML(t, c, role);
     if (t.destination) initTrackMap(t);
-    bindVisitControls(c, role);
+    bindVisitControls(c, role, t);
     if (trackTimer) clearInterval(trackTimer);
-    if (t.visit && t.visit.status === "ON_THE_WAY") {
+    if (t.visit && ["ON_THE_WAY", "NEARBY", "DELAYED"].includes(t.visit.status)) {
       trackTimer = setInterval(async () => {
-        try {
-          const fresh = await api(`/cases/${c.id}/track`);
-          updateTrackMap(fresh);
-          if (fresh.visit && fresh.visit.status !== "ON_THE_WAY") clearInterval(trackTimer);
-        } catch (e) {}
-      }, 3000);
+        try { const fresh = await api(`/cases/${c.id}/track`); updateTrackMap(fresh); } catch (e) {}
+      }, 10000);
     }
   } catch (err) { wrap.innerHTML = ""; }
 }
 
-function bindVisitControls(c, role) {
+function bindVisitControls(c, role, tracking) {
   if (role !== "vet") return;
   const startBtn = document.getElementById("btnStartTrip");
   if (startBtn) startBtn.addEventListener("click", async () => {
-    try { await api(`/cases/${c.id}/visit`, { method: "POST" }); toast("Visit started!"); loadTracking(c, role); }
+    try { const v = await api(`/cases/${c.id}/visit`, { method: "POST" }); toast("Visit accepted. Start GPS sharing when ready."); loadTracking(c, role); }
     catch (err) { toast(err.message, true); }
   });
+  const gpsBtn = document.getElementById("btnStartTracking");
+  if (gpsBtn) gpsBtn.addEventListener("click", async () => {
+    try { const v = await api(`/cases/${c.id}/visit`, { method: "POST" }); await api(`/visits/${v.id}/start-tracking`, { method: "POST", body: { duration_minutes: 120 } }); startVetLocationWatch(v.id); toast("Secure GPS sharing started. Keep this visit active."); loadTracking(c, role); }
+    catch (err) { toast(err.message, true); }
+  });
+  const stopBtn = document.getElementById("btnStopTracking");
+  if (stopBtn) stopBtn.addEventListener("click", async () => { try { await api(`/visits/${tracking.visit.id}/stop-tracking`, { method: "POST", body: { reason: "veterinarian_stopped" } }); stopVetLocationWatch(); loadTracking(c, role); } catch (err) { toast(err.message, true); } });
   const arrBtn = document.getElementById("btnArrived");
-  if (arrBtn) arrBtn.addEventListener("click", async () => {
-    try { await api(`/cases/${c.id}/visit`, { method: "PUT", body: { status: "ARRIVED" } }); toast("Arrived at farm!"); loadTracking(c, role); }
-    catch (err) { toast(err.message, true); }
-  });
+  if (arrBtn) arrBtn.addEventListener("click", async () => { try { await api(`/cases/${c.id}/visit`, { method: "PUT", body: { status: "ARRIVED" } }); stopVetLocationWatch(); toast("Arrived at farm. Location sharing stopped."); loadTracking(c, role); } catch (err) { toast(err.message, true); } });
   const compBtn = document.getElementById("btnCompleteTrip");
-  if (compBtn) compBtn.addEventListener("click", async () => {
-    try { await api(`/cases/${c.id}/visit`, { method: "PUT", body: { status: "COMPLETED" } }); toast("Visit marked completed!"); loadTracking(c, role); }
-    catch (err) { toast(err.message, true); }
-  });
+  if (compBtn) compBtn.addEventListener("click", async () => { try { await api(`/cases/${c.id}/visit`, { method: "PUT", body: { status: "COMPLETED" } }); stopVetLocationWatch(); toast("Consultation completed."); loadTracking(c, role); } catch (err) { toast(err.message, true); } });
+  if (tracking?.tracking?.status === "ACTIVE") startVetLocationWatch(tracking.visit.id);
 }
 
 function vetCaseActions(c, allergies = []) {
@@ -2787,23 +2864,56 @@ function prescriptionsView(role) {
 prescriptionsView("owner"); prescriptionsView("vet"); prescriptionsView("lab");
 
 // ======================================================= LAB REPORTS ====
+function vetLabTrackingView() {
+  route("#/vet/lab-reports", async () => {
+    render(`${header("Laboratory Reports / Lab Tracking", { back: true })}<div class="loading">Loading laboratory cases…</div>`);
+    const [reports, summary] = await Promise.all([api("/veterinarian/lab-reports"), api("/vet/summary")]);
+    const renderRows = rows => rows.length ? rows.map(l => `
+      <div class="list-card" onclick="location.hash='#/vet/lab-tracking/${l.report_id || l.sample_id}'">
+        <div class="row1"><span class="title">${l.report_no || "Report pending"}</span><span class="badge ${statusBadgeClass(l.current_status)}">${l.current_status}</span></div>
+        <div class="meta"><b>Case:</b> ${l.case_no} · <b>Sample:</b> ${l.sample_code} · <b>QR:</b> ${(l.qr_token || "—").slice(0, 14)}</div>
+        <div class="meta"><b>Farmer:</b> ${l.farmer_name || "—"} · ${l.village || "—"}, ${l.district || "—"} · <b>Animal:</b> ${l.animal_species || l.animal_type || "—"}</div>
+        <div class="meta"><b>Test:</b> ${l.test_name || l.test_type || "Pending"} · <b>Result:</b> ${l.result || "Pending"} · <b>Priority:</b> ${l.request_priority || "Normal"}</div>
+        <div class="meta">Collected: ${fmtDate(l.sample_collection_at)} · Laboratory: ${l.laboratory || "Not assigned"} · Updated: ${fmtDate(l.last_updated_at || l.sample_updated_at)}</div>
+      </div>`).join("") : emptyState("No laboratory cases match these filters.");
+    render(`
+      ${header("Laboratory Reports / Lab Tracking", { back: true })}
+      <div class="stat-grid">${statCard(reports.filter(r => ["RESULT_READY","REPORT_SENT_TO_VET","VET_ACTION_REQUIRED"].includes(r.current_status)).length, "Pending reports")}${statCard(reports.filter(r => ["VET_ACTION_REQUIRED"].includes(r.current_status)).length, "Action required")}${statCard(reports.filter(r => r.request_priority === "High" || r.request_priority === "Critical").length, "Priority")}${statCard(reports.filter(r => r.current_status === "CASE_RESOLVED").length, "Completed")}</div>
+      <div class="section-card">
+        <div class="section-title">Live laboratory lifecycle</div>
+        <div class="meta">This veterinary view is backed by committed sample/report events. It does not simulate movement or laboratory updates.</div>
+        <div class="form-row" style="margin-top:12px"><div class="field"><label>Search</label><input id="labTrackSearch" placeholder="Report, case, QR, farmer" /></div><div class="field"><label>Status</label><select id="labTrackStatus"><option value="">All statuses</option>${["SAMPLE_COLLECTED","SAMPLE_IN_TRANSIT","RECEIVED_BY_LAB","TESTING","RESULT_PENDING","RESULT_READY","REPORT_SENT_TO_VET","VET_ACTION_REQUIRED","CASE_RESOLVED"].map(x => `<option>${x}</option>`).join("")}</select></div></div>
+        <div class="form-row"><div class="field"><label>District</label><input id="labTrackDistrict" /></div><div class="field"><label>Priority</label><select id="labTrackPriority"><option value="">All</option><option>High</option><option>Critical</option><option>Normal</option></select></div><button class="btn btn-primary btn-sm" id="labTrackApply" style="align-self:end">Filter</button></div>
+      </div>
+      <div id="labTrackRows" class="section-card">${renderRows(reports)}</div>
+      ${bottomNav("#/vet/lab-reports")}
+    `);
+    document.getElementById("labTrackApply")?.addEventListener("click", async () => {
+      const query = new URLSearchParams({ q: document.getElementById("labTrackSearch").value, status: document.getElementById("labTrackStatus").value, district: document.getElementById("labTrackDistrict").value, priority: document.getElementById("labTrackPriority").value });
+      try { const filtered = await api(`/veterinarian/lab-reports?${query}`); document.getElementById("labTrackRows").innerHTML = renderRows(filtered); } catch (e) { toast(e.message, true); }
+    });
+  }, ["vet"]);
+}
+
+route("#/vet/lab-tracking/:id", async ({ id }) => {
+  render(`${header("Laboratory Report Detail", { back: true })}<div class="loading">Loading…</div>`);
+  try {
+    const r = await api(`/veterinarian/lab-reports/${id}`);
+    render(`${header(r.report_no || "Laboratory Report", { back: true })}
+      <div class="section-card"><div class="row1"><span class="title">${r.report_no || "Pending report"}</span><span class="badge ${statusBadgeClass(r.current_status)}">${r.current_status}</span></div>
+      <div class="detail-grid"><div><b>Case ID</b>${r.case_no}</div><div><b>Sample / QR</b>${r.sample_code} / ${(r.qr_token || "—").slice(0, 18)}</div><div><b>Farmer</b>${r.farmer_name} (${r.farmer_phone || "—"})</div><div><b>Village / Block / District</b>${r.village || "—"} / ${r.block || "—"} / ${r.district || "—"}</div><div><b>Animal</b>${r.animal_species || r.animal_type || "—"}</div><div><b>Disease suspected</b>${r.disease_suspected || "—"}</div><div><b>Symptoms</b>${r.symptoms || "—"}</div><div><b>Collected / received</b>${fmtDate(r.sample_collection_at)} / ${fmtDate(r.sample_updated_at)}</div><div><b>Laboratory</b>${r.laboratory || "—"}</div><div><b>Assigned veterinarian</b>${r.assigned_veterinarian || "—"}</div><div><b>Test / result</b>${r.test_name || r.test_type || "—"} / ${r.result || "Pending"}</div><div><b>Priority</b>${r.request_priority || "Normal"}</div></div>
+      <div class="btn-row" style="margin-top:16px"><a class="btn btn-ghost btn-sm" href="/api/veterinarian/lab-reports/${r.report_id}/download?access_token=${encodeURIComponent(state.token)}">⬇️ Download report</a>${["REPORT_SENT_TO_VET","RESULT_READY"].includes(r.current_status) ? `<button class="btn btn-primary btn-sm" id="labReviewBtn">Mark reviewed</button>` : ""}</div></div>
+      <div class="section-card"><div class="subheading">Report timeline &amp; audit history</div><div class="timeline">${(r.timeline || []).map(e => `<div class="timeline-item"><div class="timeline-dot"></div><div class="timeline-body"><div class="t-status">${e.to_status}</div><div class="t-note">${e.note || ""} · ${e.actor_role || "system"}</div><div class="t-date">${fmtDate(e.created_at)}</div></div></div>`).join("") || emptyState("No status history yet.")}</div></div>`);
+    document.getElementById("labReviewBtn")?.addEventListener("click", async () => { try { await api(`/lab-reports/${r.report_id}/status`, { method: "PATCH", body: { status: "REPORT_REVIEWED" } }); toast("Report marked reviewed"); router(); } catch (e) { toast(e.message, true); } });
+  } catch (e) { render(`${header("Laboratory Report", { back: true })}${emptyState(e.message)}`); }
+}, ["vet"]);
+
 function labReportsView(role) {
+  if (role === "vet") { vetLabTrackingView(); return; }
   route(`#/${role}/lab-reports`, async () => {
     render(`${header("Lab Reports", { back: true })}<div class="loading">Loading…</div>`);
     const reps = await api("/lab/reports");
-    render(`
-      ${header("Lab Reports", { back: true })}
-      <div class="section-card">
-        ${reps.length === 0 ? emptyState("No lab reports yet.") : reps.map(l => `
-          <div class="list-card" onclick="location.hash='#/${role}/cases/${l.case_id}'">
-            <div class="row1"><span class="title">${l.report_no}</span><span class="badge ${l.result === 'NEGATIVE' ? 'badge-green' : 'badge-red'}">${l.result || "Pending"}</span></div>
-            <div class="meta">${l.animal_code}${l.animal_name ? " · " + l.animal_name : ""} · ${l.test_name || ""}</div>
-            <div class="meta">Case ${l.case_no} · Sample: ${l.sample || "—"} · ${fmtDate(l.test_date)}</div>
-            ${l.notes ? `<div class="meta">${l.notes}</div>` : ""}
-          </div>`).join("")}
-      </div>
-      ${bottomNav(role === "owner" ? "#/owner/lab-reports" : role === "lab" ? "#/lab/lab-reports" : `#/${role}/dashboard`)}
-    `);
+    render(`${header("Lab Reports", { back: true })}<div class="section-card">${reps.length === 0 ? emptyState("No lab reports yet.") : reps.map(l => `<div class="list-card" onclick="location.hash='#/${role}/cases/${l.case_id}'"><div class="row1"><span class="title">${l.report_no}</span><span class="badge ${l.result === 'NEGATIVE' ? 'badge-green' : 'badge-red'}">${l.result || "Pending"}</span></div><div class="meta">${l.animal_code}${l.animal_name ? " · " + l.animal_name : ""} · ${l.test_name || ""}</div><div class="meta">Case ${l.case_no} · Sample: ${l.sample || "—"} · ${fmtDate(l.test_date)}</div></div>`).join("")}</div>${bottomNav(role === "owner" ? "#/owner/lab-reports" : "#/lab/lab-reports")}`);
   }, [role]);
 }
 labReportsView("owner"); labReportsView("vet"); labReportsView("lab");
