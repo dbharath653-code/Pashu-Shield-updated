@@ -10,7 +10,7 @@ import io
 import base64
 from datetime import datetime, timedelta, date
 from functools import wraps
-from flask import Flask, request, jsonify, g, send_from_directory
+from flask import Flask, request, jsonify, g, send_from_directory, Response, stream_with_context
 from PIL import Image
 import cv2
 import numpy as np
@@ -24,6 +24,7 @@ from database import (
 import weather
 import animal_ai
 import secrets as _secrets_for_ivr
+from notifications import SMSProvider, provider_health
 
 # IVR integration - production-grade IVR reporting channel
 try:
@@ -126,8 +127,59 @@ def row_to_dict(row):
     return dict(row) if row else None
 
 
-def notify(conn, user_id, message, type_="info"):
-    conn.execute("INSERT INTO notifications (user_id, message, type) VALUES (?,?,?)", (user_id, message, type_))
+EVENT_SCHEMA_VERSION = 1
+
+
+def emit_event(conn, event_type: str, payload: dict | None = None, *, case_id=None,
+               actor_id=None, actor_role=None, idempotency_key=None):
+    """Persist one validated, replayable realtime event.
+
+    SQLite is the source of truth for the SSE event stream. INSERT OR IGNORE
+    makes webhook retries and offline retries idempotent; consumers can safely
+    reconnect using Last-Event-ID.
+    """
+    allowed = re.compile(r"^[A-Z][A-Z0-9_]{2,80}$")
+    event_type = str(event_type or "").upper()
+    if not allowed.match(event_type):
+        raise ValueError("invalid event_type")
+    event_id = str(uuid.uuid4())
+    payload = payload or {}
+    conn.execute(
+        "INSERT OR IGNORE INTO realtime_events (event_id,event_type,schema_version,case_id,actor_id,actor_role,payload,idempotency_key) VALUES (?,?,?,?,?,?,?,?)",
+        (event_id, event_type, EVENT_SCHEMA_VERSION, case_id, actor_id, actor_role,
+         json.dumps(payload, ensure_ascii=False), idempotency_key),
+    )
+    if idempotency_key:
+        row = conn.execute("SELECT event_id FROM realtime_events WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+        return row["event_id"] if row else event_id
+    return event_id
+
+
+def notify(conn, user_id, message, type_="info", *, case_id=None,
+           event_type="NOTIFICATION_CREATED", data=None, idempotency_key=None):
+    """Create an in-app notification and its realtime event.
+
+    Existing callers keep the original four-argument contract. External
+    channels are opt-in through the unified notification endpoint, so ordinary
+    case/lab writes never claim that SMS was delivered.
+    """
+    if not user_id:
+        return None
+    recipient = conn.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
+    role = recipient["role"] if recipient else None
+    idem = idempotency_key or f"notif:{event_type}:{user_id}:{case_id or ''}:{message}"
+    event_id = emit_event(conn, event_type, {"message": message, "type": type_, **(data or {}), "recipient_id": user_id},
+                          case_id=case_id, actor_id=None, actor_role="system",
+                          idempotency_key=idem)
+    existing = conn.execute("SELECT id FROM notifications WHERE idempotency_key=?", (idem,)).fetchone()
+    if existing:
+        return existing["id"]
+    cur = conn.execute(
+        "INSERT INTO notifications (user_id,message,type,event_id,idempotency_key,recipient_role,channel,delivery_status,case_id,data_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (user_id, message, type_, event_id, idem, role, "in_app", "DELIVERED", case_id,
+         json.dumps(data or {}, ensure_ascii=False)),
+    )
+    return cur.lastrowid
 
 
 def case_json(conn, row):
@@ -829,13 +881,24 @@ def create_case():
     conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
                  (case_id, "NEW", "Case reported by owner", g.user["name"]))
     conn.execute("UPDATE animals SET status='Under Observation' WHERE id=?", (animal["id"],))
+    emit_event(conn, "CASE_CREATED", {"case_id": case_id, "case_no": case_no, "severity": data.get("severity", "Medium")}, case_id=case_id, actor_id=g.user["uid"], actor_role="owner", idempotency_key=f"case-created:{case_id}")
+    # Persist only a location explicitly supplied by the farmer. Village and
+    # district fields remain textual and never become fabricated coordinates.
+    if any(data.get(k) is not None for k in ("lat", "lng", "latitude", "longitude")) or any(data.get(k) for k in ("village", "block", "district")):
+        try:
+            _record_case_location(conn, case_id, data, g.user["uid"], default_source=("GPS" if data.get("lat", data.get("latitude")) is not None else "FARMER_PROVIDED"))
+        except (TypeError, ValueError) as exc:
+            conn.rollback(); conn.close(); return jsonify({"error": f"Invalid case location: {exc}"}), 400
 
     if vet_id:
-        notify(conn, vet_id, f"New case assigned: {case_no} for {animal['animal_code']}", "case")
+        notify(conn, vet_id, f"New case assigned: {case_no} for {animal['animal_code']}", "case", case_id=case_id, event_type="VET_ASSIGNED")
     else:
         vets = conn.execute("SELECT id FROM users WHERE role='vet' AND district=?", (district,)).fetchall()
         for v in vets:
-            notify(conn, v["id"], f"New report in your district: {case_no}", "case")
+            notify(conn, v["id"], f"New report in your district: {case_no}", "case", case_id=case_id, event_type="VET_ASSIGNED")
+    if str(data.get("severity", "Medium")).lower() in {"high", "critical"} or not vet_id:
+        for official in conn.execute("SELECT id FROM users WHERE role='govt'").fetchall():
+            notify(conn, official["id"], f"Authorised case alert {case_no}: priority {data.get('severity', 'Medium')} in {district}.", "case", case_id=case_id, event_type="NOTIFICATION_CREATED")
 
     audit_log(conn, "CREATE_CASE", "case", case_id, actor_id=g.user["uid"],
               actor_name=g.user["name"], actor_role=g.user["role"],
@@ -902,8 +965,13 @@ def list_cases():
         rows = conn.execute(
             "SELECT * FROM cases WHERE vet_id=? OR vet_id IS NULL ORDER BY id DESC", (g.user["uid"],)
         ).fetchall()
-    else:
+        rows = [r for r in rows if _can_access_case(conn, r, allow_govt=False)]
+    elif role == "govt":
         rows = conn.execute("SELECT * FROM cases ORDER BY id DESC").fetchall()
+        rows = [r for r in rows if _can_access_case(conn, r)]
+    else:
+        # Laboratory staff use the sample/report APIs, not case-level access.
+        rows = []
     out = [case_json(conn, r) for r in rows]
     conn.close()
     return jsonify(out)
@@ -920,6 +988,12 @@ def get_case(case_id):
     if g.user["role"] == "owner" and case["owner_id"] != g.user["uid"]:
         conn.close()
         return jsonify({"error": "Not authorized"}), 403
+    if g.user["role"] == "vet" and not _can_access_case(conn, case, allow_govt=False):
+        conn.close()
+        return jsonify({"error": "Not authorized for this case"}), 403
+    if g.user["role"] == "lab":
+        conn.close()
+        return jsonify({"error": "Laboratory staff must use sample processing APIs"}), 403
 
     result = case_json(conn, case)
     updates = conn.execute("SELECT * FROM case_updates WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
@@ -947,6 +1021,11 @@ def get_case(case_id):
     result["samples"] = samples_out
     result["treatment_responses"] = [row_to_dict(t) for t in treatment_responses]
     result["animal_allergies"] = [row_to_dict(a) for a in allergies]
+    result["location"] = _case_location(conn, case_id)
+    result["visit"] = None
+    latest_visit = conn.execute("SELECT id FROM case_visits WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)).fetchone()
+    if latest_visit and _can_access_case(conn, case):
+        result["visit"] = _visit_response(conn, latest_visit["id"])
 
     conn.close()
     return jsonify(result)
@@ -961,6 +1040,9 @@ def update_case(case_id):
     if not case:
         conn.close()
         return jsonify({"error": "Case not found"}), 404
+    if not _can_access_case(conn, case, allow_govt=False):
+        conn.close()
+        return jsonify({"error": "This case is outside your authorized veterinarian jurisdiction"}), 403
 
     new_status = data.get("status") or case["status"]
     diagnosis = data.get("diagnosis", case["diagnosis"])
@@ -1016,139 +1098,412 @@ def delete_case(case_id):
         conn.close()
 
 
-# ------------------------------------------------ live visit tracking ---
-DISTRICT_CENTROIDS = {
-    "pune": (18.5204, 73.8567),
-    "satara": (17.6805, 74.0183),
-    "aurangabad": (19.8762, 75.3433),
-    "nagpur": (21.1458, 79.0882),
-    "nashik": (20.0110, 73.7903),
-    "nanded": (19.1383, 77.3210),
-    "latur": (18.4088, 76.5604),
-    "solapur": (17.6599, 75.9064),
-    "kolhapur": (16.7050, 74.2433),
-    "ahmednagar": (19.0952, 74.7496),
+@app.post("/api/cases/<int:case_id>/location")
+@auth_required(roles=["owner", "vet", "govt"])
+def update_case_location(case_id):
+    conn = get_db()
+    case = _case_for_visit(conn, case_id)
+    if not case or not _can_access_case(conn, case):
+        conn.close(); return jsonify({"error": "Case not found or not authorized"}), 404
+    data = request.get_json(force=True) or {}
+    try:
+        _record_case_location(conn, case_id, data, g.user["uid"], default_source="GPS")
+    except (TypeError, ValueError) as exc:
+        conn.close(); return jsonify({"error": str(exc)}), 400
+    loc = _case_location(conn, case_id)
+    emit_event(conn, "CASE_LOCATION_UPDATED", {"case_id": case_id, "source": loc["source"], "has_coordinates": loc["latitude"] is not None}, case_id=case_id, actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"case-location:{case_id}:{loc['id']}")
+    conn.commit(); conn.close(); return jsonify(loc), 201
+
+
+@app.get("/api/cases/<int:case_id>/location")
+@auth_required()
+def get_case_location(case_id):
+    conn = get_db(); case = _case_for_visit(conn, case_id)
+    if not case or not _can_access_case(conn, case):
+        conn.close(); return jsonify({"error": "Case not found or not authorized"}), 404
+    loc = _case_location(conn, case_id); conn.close()
+    return jsonify(loc or {"source": "NOT_AVAILABLE", "latitude": None, "longitude": None})
+
+
+@app.post("/api/telephony/location")
+@auth_required(roles=["owner", "vet", "govt"])
+def telephony_location():
+    """Attach authenticated farmer-app GPS to an active helpline call.
+
+    A PSTN carrier does not provide GPS here. The farmer's signed-in browser or
+    app explicitly posts the observation while the call session is active.
+    """
+    data = request.get_json(force=True) or {}
+    call_sid = str(data.get("call_sid") or "").strip()
+    if not call_sid: return jsonify({"error": "call_sid is required"}), 400
+    conn = get_db()
+    call = conn.execute("SELECT * FROM ivr_calls WHERE call_sid=?", (call_sid,)).fetchone()
+    if not call: conn.close(); return jsonify({"error": "Call session not found"}), 404
+    report = conn.execute("SELECT * FROM ivr_reports WHERE call_sid=? ORDER BY id DESC LIMIT 1", (call_sid,)).fetchone()
+    session = conn.execute("SELECT * FROM ivr_sessions WHERE call_sid=? ORDER BY id DESC LIMIT 1", (call_sid,)).fetchone()
+    if g.user["role"] == "owner":
+        if not ((report and report["caller_user_id"] == g.user["uid"]) or (session and session["caller_user_id"] == g.user["uid"])):
+            conn.close(); return jsonify({"error": "This call is not associated with your account"}), 403
+    case = _case_for_visit(conn, report["case_id"]) if report and report["case_id"] else None
+    if case and not _can_access_case(conn, case):
+        conn.close(); return jsonify({"error": "Not authorized for this case"}), 403
+    if not case:
+        conn.close(); return jsonify({"error": "The helpline case has not been created yet"}), 409
+    try:
+        payload = {**data, "source": "GPS"}
+        _record_case_location(conn, case["id"], payload, g.user["uid"], default_source="GPS")
+        lat, lng = float(payload.get("lat", payload.get("latitude"))), float(payload.get("lng", payload.get("longitude")))
+    except (TypeError, ValueError) as exc:
+        conn.close(); return jsonify({"error": f"valid GPS coordinates are required: {exc}"}), 400
+    conn.execute("UPDATE ivr_reports SET location_lat=?,location_lng=?,location_source='GPS',location_accuracy=? WHERE id=?", (lat, lng, data.get("accuracy", "farmer app GPS"), report["id"]))
+    emit_event(conn, "HELPLINE_LOCATION_UPDATED", {"call_sid": call_sid, "case_id": case["id"], "source": "GPS"}, case_id=case["id"], actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"helpline-location:{call_sid}:{data.get('timestamp', '')}:{lat}:{lng}")
+    if case["vet_id"]:
+        notify(conn, case["vet_id"], f"GPS location shared for helpline case {case['case_no']}.", "case", case_id=case["id"], event_type="HELPLINE_LOCATION_UPDATED")
+    for official in conn.execute("SELECT id FROM users WHERE role='govt'").fetchall():
+        notify(conn, official["id"], f"Authorised GPS location received for helpline case {case['case_no']}.", "case", case_id=case["id"], event_type="HELPLINE_LOCATION_UPDATED")
+    conn.commit(); loc = _case_location(conn, case["id"]); conn.close()
+    return jsonify({"ok": True, "location": loc})
+
+
+# ------------------------------------------------ case-based visit tracking ---
+# Coordinates are NEVER derived from a district or a clock.  A map position is
+# present only after an authorised device posts a validated GPS observation.
+VISIT_STATUSES = {
+    "ASSIGNED", "ACCEPTED", "PREPARING", "ON_THE_WAY", "NEARBY", "ARRIVED",
+    "CONSULTATION_STARTED", "COMPLETED", "CANCELLED", "DELAYED",
 }
+STOP_TRACKING_STATUSES = {"ARRIVED", "COMPLETED", "CANCELLED"}
 
 
-def fallback_coords(district):
-    d = (district or "").strip().lower()
-    return DISTRICT_CENTROIDS.get(d, (18.5204, 73.8567))
+def _case_for_visit(conn, case_id):
+    return conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+
+
+def _can_access_case(conn, case, *, allow_govt=True):
+    return _can_access_case_for_user(conn, case, g.user, allow_govt=allow_govt)
+
+
+def _can_access_case_for_user(conn, case, user, *, allow_govt=True):
+    if not case:
+        return False
+    role = user["role"]
+    if role == "owner":
+        return case["owner_id"] == user["uid"]
+    animal = conn.execute("SELECT district FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
+    case_district = (animal["district"] if animal else None) or ""
+    actor = conn.execute("SELECT district FROM users WHERE id=?", (user["uid"],)).fetchone()
+    actor_district = (actor["district"] if actor else None) or ""
+    if role == "vet":
+        if case["vet_id"] == user["uid"]:
+            return True
+        # Unassigned cases are visible to veterinarians only within their
+        # registered jurisdiction; assignment itself is a stronger grant.
+        return case["vet_id"] is None and (not actor_district or not case_district or actor_district.lower() == case_district.lower())
+    if role == "govt":
+        return allow_govt and (not actor_district or not case_district or actor_district.lower() == case_district.lower())
+    return False
+
+
+def _can_access_sample(conn, sample):
+    """Apply case-level authorization to every sample read/write path."""
+    if not sample:
+        return False
+    if g.user["role"] == "lab":
+        return True  # laboratory staff are restricted to sample/report APIs
+    case = _case_for_visit(conn, sample["case_id"])
+    return _can_access_case(conn, case)
+
+
+def _case_location(conn, case_id):
+    row = conn.execute(
+        "SELECT * FROM case_locations WHERE case_id=? AND is_current=1 ORDER BY id DESC LIMIT 1",
+        (case_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _visit_response(conn, visit_id, include_history=False):
+    visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit_id,)).fetchone()
+    if not visit:
+        return None
+    out = dict(visit)
+    case = conn.execute("SELECT case_no,owner_id,vet_id FROM cases WHERE id=?", (visit["case_id"],)).fetchone()
+    out["case_no"] = case["case_no"] if case else None
+    out["farmer_location"] = _case_location(conn, visit["case_id"])
+    session = conn.execute(
+        "SELECT * FROM visit_tracking_sessions WHERE visit_id=? ORDER BY id DESC LIMIT 1", (visit_id,)
+    ).fetchone()
+    out["tracking"] = dict(session) if session else None
+    latest = conn.execute(
+        "SELECT * FROM visit_locations WHERE visit_id=? ORDER BY captured_at DESC, id DESC LIMIT 1", (visit_id,)
+    ).fetchone()
+    out["latest_location"] = dict(latest) if latest else None
+    if include_history:
+        out["location_history"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM visit_locations WHERE visit_id=? ORDER BY captured_at ASC, id ASC", (visit_id,)
+        ).fetchall()]
+    return out
+
+
+def _stop_tracking_for_visit(conn, visit_id, reason):
+    conn.execute(
+        "UPDATE visit_tracking_sessions SET status='STOPPED', stopped_at=datetime('now'), stop_reason=? WHERE visit_id=? AND status='ACTIVE'",
+        (reason, visit_id),
+    )
+
+
+def _record_case_location(conn, case_id, data, actor_id, *, default_source="NOT_AVAILABLE"):
+    lat, lng = data.get("latitude", data.get("lat")), data.get("longitude", data.get("lng"))
+    source = (data.get("source") or default_source or "NOT_AVAILABLE").upper()
+    if source not in {"GPS", "NETWORK", "FARMER_PROVIDED", "PROFILE", "MANUAL", "NOT_AVAILABLE"}:
+        raise ValueError("invalid location source")
+    if lat is None or lng is None:
+        lat = lng = None
+        source = "NOT_AVAILABLE" if source in {"GPS", "NETWORK"} else source
+    else:
+        lat, lng = float(lat), float(lng)
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            raise ValueError("coordinates are out of range")
+    conn.execute("UPDATE case_locations SET is_current=0 WHERE case_id=?", (case_id,))
+    conn.execute(
+        "INSERT INTO case_locations (case_id,source,latitude,longitude,accuracy_m,village,block,district,state,captured_by) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (case_id, source, lat, lng, data.get("accuracy", data.get("accuracy_m")),
+         data.get("village"), data.get("block"), data.get("district"), data.get("state", "Maharashtra"), actor_id),
+    )
 
 
 @app.post("/api/cases/<int:case_id>/visit")
 @auth_required(roles=["vet"])
 def start_visit(case_id):
     conn = get_db()
-    case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+    case = _case_for_visit(conn, case_id)
     if not case:
         conn.close()
         return jsonify({"error": "Case not found"}), 404
-    animal = conn.execute("SELECT district FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
-    to_lat, to_lng = fallback_coords(animal["district"] if animal else "")
+    if not _can_access_case(conn, case, allow_govt=False):
+        conn.close()
+        return jsonify({"error": "This case is outside your authorized veterinarian jurisdiction"}), 403
+    existing = conn.execute(
+        "SELECT id FROM case_visits WHERE case_id=? AND vet_id=? AND status NOT IN ('COMPLETED','CANCELLED') ORDER BY id DESC LIMIT 1",
+        (case_id, g.user["uid"]),
+    ).fetchone()
+    if existing:
+        result = _visit_response(conn, existing["id"])
+        conn.close()
+        return jsonify(result)
     data = request.get_json(silent=True) or {}
-    f_lat = data.get("from_lat", to_lat - 0.04)
-    f_lng = data.get("from_lng", to_lng - 0.035)
-    t_lat = data.get("to_lat", to_lat)
-    t_lng = data.get("to_lng", to_lng)
-    travel_seconds = int(data.get("travel_seconds", 240))
-
+    # Optional coordinates are accepted only as an actual device observation.
+    # They are not replaced with district centroids when absent.
+    from_lat, from_lng = data.get("from_lat"), data.get("from_lng")
+    to_loc = _case_location(conn, case_id)
+    to_lat = to_lng = None
+    if to_loc and to_loc.get("latitude") is not None:
+        to_lat, to_lng = to_loc["latitude"], to_loc["longitude"]
     cur = conn.execute(
-        "INSERT INTO case_visits (case_id, vet_id, status, from_lat, from_lng, to_lat, to_lng, travel_seconds, started_at) "
-        "VALUES (?,?,?,?,?,?,?,?, datetime('now'))",
-        (case_id, g.user["uid"], "ON_THE_WAY", f_lat, f_lng, t_lat, t_lng, travel_seconds),
+        "INSERT INTO case_visits (case_id,vet_id,status,from_lat,from_lng,to_lat,to_lng,travel_seconds,started_at) VALUES (?,?,?,?,?,?,?,NULL,datetime('now'))",
+        (case_id, g.user["uid"], "ON_THE_WAY", from_lat, from_lng, to_lat, to_lng),
     )
-    conn.execute("UPDATE cases SET status='UNDER INVESTIGATION', vet_id=? WHERE id=?", (g.user["uid"], case_id))
-    conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
-                 (case_id, "UNDER INVESTIGATION", "Veterinarian has started live field visit.", g.user["name"]))
-    notify(conn, case["owner_id"], f"Dr. {g.user['name']} is on the way to examine your animal for {case['case_no']}.", "case")
+    conn.execute("UPDATE cases SET vet_id=?, status='UNDER INVESTIGATION', updated_at=datetime('now') WHERE id=?", (g.user["uid"], case_id))
+    conn.execute("INSERT INTO case_updates (case_id,status,note,updated_by) VALUES (?,?,?,?)",
+                 (case_id, "ON_THE_WAY", "Veterinarian accepted the case and started the visit.", g.user["name"]))
+    emit_event(conn, "VET_STARTED_VISIT", {"visit_id": cur.lastrowid, "status": "ON_THE_WAY"},
+               case_id=case_id, actor_id=g.user["uid"], actor_role="vet",
+               idempotency_key=f"visit-start:{case_id}:{g.user['uid']}")
+    notify(conn, case["owner_id"], f"Dr. {g.user['name']} is on the way for case {case['case_no']}.", "case", case_id=case_id, event_type="VET_STARTED_VISIT")
     conn.commit()
-    visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (cur.lastrowid,)).fetchone()
+    result = _visit_response(conn, cur.lastrowid)
     conn.close()
-    return jsonify(row_to_dict(visit)), 201
+    return jsonify(result), 201
+
+
+@app.post("/api/visits")
+@auth_required(roles=["vet"])
+def create_visit():
+    data = request.get_json(force=True) or {}
+    case_id = data.get("case_id")
+    if not case_id:
+        return jsonify({"error": "case_id is required"}), 400
+    return start_visit(int(case_id))
+
+
+@app.patch("/api/visits/<int:visit_id>/status")
+@auth_required(roles=["vet"])
+def patch_visit_status(visit_id):
+    data = request.get_json(force=True) or {}
+    status = str(data.get("status") or "").upper()
+    if status not in VISIT_STATUSES:
+        return jsonify({"error": f"Invalid visit status. Allowed: {', '.join(sorted(VISIT_STATUSES))}"}), 400
+    conn = get_db()
+    visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit_id,)).fetchone()
+    if not visit:
+        conn.close()
+        return jsonify({"error": "Visit not found"}), 404
+    if visit["vet_id"] != g.user["uid"]:
+        conn.close()
+        return jsonify({"error": "Only the assigned veterinarian can update this visit"}), 403
+    updates = ["status=?"]
+    params = [status]
+    if status == "ARRIVED": updates.append("arrived_at=datetime('now')")
+    if status == "COMPLETED": updates.append("completed_at=datetime('now')")
+    conn.execute(f"UPDATE case_visits SET {', '.join(updates)} WHERE id=?", (*params, visit_id))
+    if status in STOP_TRACKING_STATUSES:
+        _stop_tracking_for_visit(conn, visit_id, status.lower())
+    case = _case_for_visit(conn, visit["case_id"])
+    note = data.get("note") or f"Veterinarian visit status changed to {status}."
+    conn.execute("INSERT INTO case_updates (case_id,status,note,updated_by) VALUES (?,?,?,?)",
+                 (visit["case_id"], status, note, g.user["name"]))
+    event_type = {"ARRIVED": "VET_ARRIVED", "COMPLETED": "VISIT_COMPLETED", "CANCELLED": "VISIT_CANCELLED"}.get(status, "VISIT_STATUS_UPDATED")
+    emit_event(conn, event_type, {"visit_id": visit_id, "status": status}, case_id=visit["case_id"], actor_id=g.user["uid"], actor_role="vet",
+               idempotency_key=f"visit-status:{visit_id}:{status}:{data.get('client_txn_id','')}")
+    if case:
+        notify(conn, case["owner_id"], f"Veterinary visit for {case['case_no']} is now {status.replace('_',' ')}.", "case", case_id=visit["case_id"], event_type=event_type)
+    conn.commit()
+    result = _visit_response(conn, visit_id)
+    conn.close()
+    return jsonify(result)
 
 
 @app.put("/api/cases/<int:case_id>/visit")
 @auth_required(roles=["vet"])
 def update_visit(case_id):
     data = request.get_json(force=True) or {}
-    new_status = data.get("status")
-    if new_status not in ("ARRIVED", "COMPLETED", "ON_THE_WAY"):
+    status = str(data.get("status") or "").upper()
+    mapping = {"ON_THE_WAY": "ON_THE_WAY", "ARRIVED": "ARRIVED", "COMPLETED": "COMPLETED", "CANCELLED": "CANCELLED", "DELAYED": "DELAYED", "NEARBY": "NEARBY", "CONSULTATION_STARTED": "CONSULTATION_STARTED"}
+    if status not in mapping:
         return jsonify({"error": "Invalid status"}), 400
     conn = get_db()
-    visit = conn.execute(
-        "SELECT * FROM case_visits WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)
-    ).fetchone()
-    if not visit:
-        conn.close()
-        return jsonify({"error": "No visit found for this case"}), 404
-
-    case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
-    if new_status == "ARRIVED":
-        conn.execute("UPDATE case_visits SET status='ARRIVED', arrived_at=datetime('now') WHERE id=?", (visit["id"],))
-        conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
-                     (case_id, case["status"], "Veterinarian arrived at animal's location.", g.user["name"]))
-        notify(conn, case["owner_id"], f"Dr. {g.user['name']} has arrived at your farm for case {case['case_no']}.", "case")
-    elif new_status == "COMPLETED":
-        conn.execute("UPDATE case_visits SET status='COMPLETED', completed_at=datetime('now') WHERE id=?", (visit["id"],))
-        conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
-                     (case_id, case["status"], "Physical field visit completed.", g.user["name"]))
-    conn.commit()
-    v = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit["id"],)).fetchone()
+    visit = conn.execute("SELECT id FROM case_visits WHERE case_id=? AND vet_id=? ORDER BY id DESC LIMIT 1", (case_id, g.user["uid"])).fetchone()
     conn.close()
-    return jsonify(row_to_dict(v))
+    if not visit:
+        return jsonify({"error": "No visit found for this case"}), 404
+    # The current request body already contains the status and g.user was
+    # authenticated by this route; call the shared implementation without
+    # creating a second Flask request context.
+    return patch_visit_status.__wrapped__(visit["id"])
+
+
+@app.post("/api/visits/<int:visit_id>/start-tracking")
+@auth_required(roles=["vet"])
+def start_visit_tracking(visit_id):
+    conn = get_db()
+    visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit_id,)).fetchone()
+    if not visit:
+        conn.close(); return jsonify({"error": "Visit not found"}), 404
+    if visit["vet_id"] != g.user["uid"]:
+        conn.close(); return jsonify({"error": "Only the assigned veterinarian can start tracking"}), 403
+    if visit["status"] in STOP_TRACKING_STATUSES:
+        conn.close(); return jsonify({"error": "Tracking cannot start for a completed or cancelled visit"}), 409
+    active = conn.execute("SELECT * FROM visit_tracking_sessions WHERE visit_id=? AND status='ACTIVE'", (visit_id,)).fetchone()
+    if active:
+        result = _visit_response(conn, visit_id); conn.close(); return jsonify(result)
+    data = request.get_json(silent=True) or {}
+    minutes = max(5, min(int(data.get("duration_minutes", os.environ.get("VISIT_TRACKING_MAX_MINUTES", "120"))), 240))
+    cur = conn.execute(
+        "INSERT INTO visit_tracking_sessions (visit_id,case_id,vet_id,status,expires_at) VALUES (?,?,?,'ACTIVE',datetime('now',?))",
+        (visit_id, visit["case_id"], g.user["uid"], f"+{minutes} minutes"),
+    )
+    emit_event(conn, "TRACKING_STARTED", {"visit_id": visit_id, "tracking_session_id": cur.lastrowid, "expires_in_minutes": minutes},
+               case_id=visit["case_id"], actor_id=g.user["uid"], actor_role="vet", idempotency_key=f"tracking-start:{visit_id}:{cur.lastrowid}")
+    case = _case_for_visit(conn, visit["case_id"])
+    if case:
+        notify(conn, case["owner_id"], f"Veterinarian location sharing started for case {case['case_no']}.", "case", case_id=visit["case_id"], event_type="TRACKING_STARTED")
+    conn.commit()
+    result = _visit_response(conn, visit_id); conn.close(); return jsonify(result), 201
+
+
+@app.post("/api/visits/<int:visit_id>/stop-tracking")
+@auth_required(roles=["vet"])
+def stop_visit_tracking(visit_id):
+    conn = get_db()
+    visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit_id,)).fetchone()
+    if not visit:
+        conn.close(); return jsonify({"error": "Visit not found"}), 404
+    if visit["vet_id"] != g.user["uid"]:
+        conn.close(); return jsonify({"error": "Only the assigned veterinarian can stop tracking"}), 403
+    reason = (request.get_json(silent=True) or {}).get("reason") or "veterinarian_stopped"
+    _stop_tracking_for_visit(conn, visit_id, reason)
+    emit_event(conn, "TRACKING_STOPPED", {"visit_id": visit_id, "reason": reason}, case_id=visit["case_id"], actor_id=g.user["uid"], actor_role="vet",
+               idempotency_key=f"tracking-stop:{visit_id}:{reason}")
+    conn.commit(); result = _visit_response(conn, visit_id); conn.close(); return jsonify(result)
+
+
+@app.post("/api/visits/<int:visit_id>/location")
+@auth_required(roles=["vet"])
+def post_visit_location(visit_id):
+    data = request.get_json(force=True) or {}
+    try:
+        lat = float(data.get("latitude", data.get("lat")))
+        lng = float(data.get("longitude", data.get("lng")))
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180): raise ValueError
+        accuracy = float(data["accuracy"]) if data.get("accuracy") is not None else None
+        speed = float(data["speed"]) if data.get("speed") is not None else None
+        heading = float(data["heading"]) if data.get("heading") is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "valid latitude and longitude are required"}), 400
+    conn = get_db()
+    visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit_id,)).fetchone()
+    if not visit:
+        conn.close(); return jsonify({"error": "Visit not found"}), 404
+    if visit["vet_id"] != g.user["uid"]:
+        conn.close(); return jsonify({"error": "Only the assigned veterinarian can post location"}), 403
+    session = conn.execute("SELECT * FROM visit_tracking_sessions WHERE visit_id=? AND status='ACTIVE' AND expires_at > datetime('now')", (visit_id,)).fetchone()
+    if not session:
+        conn.execute("UPDATE visit_tracking_sessions SET status='EXPIRED', stop_reason='session_expired' WHERE visit_id=? AND status='ACTIVE'", (visit_id,))
+        conn.commit(); conn.close(); return jsonify({"error": "location sharing is not active or has expired"}), 409
+    captured_at = str(data.get("timestamp") or datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+    idem = str(data.get("idempotency_key") or f"gps:{visit_id}:{captured_at}:{lat:.6f}:{lng:.6f}")
+    try:
+        conn.execute("INSERT INTO visit_locations (tracking_session_id,visit_id,case_id,vet_id,latitude,longitude,accuracy_m,speed_mps,heading_deg,captured_at,idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     (session["id"], visit_id, visit["case_id"], g.user["uid"], lat, lng, accuracy, speed, heading, captured_at, idem))
+    except sqlite3.IntegrityError:
+        existing = conn.execute("SELECT * FROM visit_locations WHERE idempotency_key=?", (idem,)).fetchone()
+        conn.close(); return jsonify({"ok": True, "duplicate": True, "location": dict(existing) if existing else None})
+    emit_event(conn, "VET_LOCATION_UPDATED", {"visit_id": visit_id, "location_id": conn.execute("SELECT last_insert_rowid() id").fetchone()["id"], "captured_at": captured_at}, case_id=visit["case_id"], actor_id=g.user["uid"], actor_role="vet", idempotency_key=f"event:{idem}")
+    conn.commit()
+    latest = conn.execute("SELECT * FROM visit_locations WHERE idempotency_key=?", (idem,)).fetchone()
+    conn.close(); return jsonify({"ok": True, "location": dict(latest)}), 201
+
+
+@app.get("/api/visits/<int:visit_id>/location")
+@auth_required()
+def get_visit_location(visit_id):
+    conn = get_db()
+    visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit_id,)).fetchone()
+    if not visit:
+        conn.close(); return jsonify({"error": "Visit not found"}), 404
+    case = _case_for_visit(conn, visit["case_id"])
+    if not _can_access_case(conn, case, allow_govt=True):
+        conn.close(); return jsonify({"error": "Not authorized to view this location"}), 403
+    result = _visit_response(conn, visit_id, include_history=(g.user["role"] in ("vet", "govt")))
+    conn.close(); return jsonify(result)
 
 
 @app.get("/api/cases/<int:case_id>/track")
 @auth_required()
 def track_visit(case_id):
     conn = get_db()
-    visit = conn.execute(
-        "SELECT * FROM case_visits WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)
-    ).fetchone()
+    case = _case_for_visit(conn, case_id)
+    if not _can_access_case(conn, case):
+        conn.close(); return jsonify({"error": "Not authorized"}), 403
+    visit = conn.execute("SELECT id FROM case_visits WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)).fetchone()
     if not visit:
-        conn.close()
-        return jsonify({"visit": None})
-
-    vd = dict(visit)
-    started = datetime.strptime(vd["started_at"][:19], "%Y-%m-%d %H:%M:%S")
-    elapsed = max(0, (datetime.utcnow() - started).total_seconds())
-    dur = float(vd["travel_seconds"] or 240)
-    frac = min(1.0, elapsed / dur)
-
-    f_lat, f_lng = vd["from_lat"], vd["from_lng"]
-    t_lat, t_lng = vd["to_lat"], vd["to_lng"]
-
-    if vd["status"] == "ON_THE_WAY":
-        cur_lat = f_lat + (t_lat - f_lat) * frac
-        cur_lng = f_lng + (t_lng - f_lng) * frac
-        if frac >= 1.0 and not vd["arrived_at"]:
-            conn.execute("UPDATE case_visits SET status='ARRIVED', arrived_at=datetime('now') WHERE id=?", (vd["id"],))
-            conn.commit()
-            vd["status"] = "ARRIVED"
-    else:
-        cur_lat, cur_lng = t_lat, t_lng
-
-    eta_seconds = max(0, int(dur - elapsed)) if vd["status"] == "ON_THE_WAY" else 0
-    vet = conn.execute("SELECT full_name, mobile, specialization FROM users WHERE id=?", (vd["vet_id"],)).fetchone()
-    conn.close()
-
-    return jsonify({
-        "visit": vd,
-        "vet": row_to_dict(vet),
-        "current_position": {"lat": round(cur_lat, 6), "lng": round(cur_lng, 6)},
-        "destination": {"lat": t_lat, "lng": t_lng},
-        "origin": {"lat": f_lat, "lng": f_lng},
-        "progress_fraction": round(frac, 3),
-        "eta_seconds": eta_seconds,
-    })
+        conn.close(); return jsonify({"visit": None, "location_status": "NOT_STARTED", "current_position": None})
+    result = _visit_response(conn, visit["id"], include_history=False)
+    result["visit"] = {k: result.get(k) for k in ("id", "case_id", "vet_id", "status", "started_at", "arrived_at", "completed_at", "from_lat", "from_lng", "to_lat", "to_lng", "travel_seconds")}
+    vet = conn.execute("SELECT full_name,mobile,specialization FROM users WHERE id=?", (result.get("vet_id"),)).fetchone()
+    result["vet"] = dict(vet) if vet else None
+    result["location_status"] = "AVAILABLE" if result["latest_location"] else "UNAVAILABLE"
+    result["current_position"] = ({"lat": result["latest_location"]["latitude"], "lng": result["latest_location"]["longitude"], "accuracy_m": result["latest_location"]["accuracy_m"], "captured_at": result["latest_location"]["captured_at"]} if result["latest_location"] else None)
+    result["destination"] = ({"lat": result["farmer_location"]["latitude"], "lng": result["farmer_location"]["longitude"]} if result["farmer_location"] and result["farmer_location"]["latitude"] is not None else None)
+    result["eta_seconds"] = None
+    conn.close(); return jsonify(result)
 
 
 @app.get("/api/vet/reports")
 @auth_required(roles=["vet"])
 def vet_reports():
     conn = get_db()
-    rows = conn.execute("SELECT * FROM cases ORDER BY id DESC").fetchall()
+    rows = conn.execute("SELECT * FROM cases WHERE vet_id=? OR vet_id IS NULL ORDER BY id DESC", (g.user["uid"],)).fetchall()
     out = [case_json(conn, r) for r in rows]
     conn.close()
     return jsonify(out)
@@ -1160,32 +1515,21 @@ def list_vets():
     conn = get_db()
     district = request.args.get("district")
     if district:
-        vets = conn.execute(
-            "SELECT id, full_name, mobile, email, specialization, village, block, district FROM users "
-            "WHERE role='vet' AND district=?", (district,)
-        ).fetchall()
+        vets = conn.execute("SELECT id, full_name, mobile, email, specialization, village, block, district FROM users WHERE role='vet' AND district=?", (district,)).fetchall()
     else:
-        vets = conn.execute(
-            "SELECT id, full_name, mobile, email, specialization, village, block, district FROM users WHERE role='vet'"
-        ).fetchall()
-    conn.close()
-    return jsonify([row_to_dict(v) for v in vets])
+        vets = conn.execute("SELECT id, full_name, mobile, email, specialization, village, block, district FROM users WHERE role='vet'").fetchall()
+    conn.close(); return jsonify([row_to_dict(v) for v in vets])
 
 
 @app.get("/api/vet/search")
 @auth_required(roles=["vet", "govt"])
 def vet_search():
     q = (request.args.get("q") or "").strip()
-    if not q:
-        return jsonify({"animals": [], "herds": []})
+    if not q: return jsonify({"animals": [], "herds": []})
     conn = get_db()
-    animals = conn.execute(
-        "SELECT * FROM animals WHERE animal_code LIKE ? OR mobile LIKE ? OR owner_name LIKE ? OR animal_name LIKE ?",
-        (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"),
-    ).fetchall()
+    animals = conn.execute("SELECT * FROM animals WHERE animal_code LIKE ? OR mobile LIKE ? OR owner_name LIKE ? OR animal_name LIKE ?", (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%")).fetchall()
     herds = conn.execute("SELECT * FROM herds WHERE herd_code LIKE ?", (f"%{q}%",)).fetchall()
-    conn.close()
-    return jsonify({"animals": [row_to_dict(a) for a in animals], "herds": [row_to_dict(h) for h in herds]})
+    conn.close(); return jsonify({"animals": [row_to_dict(a) for a in animals], "herds": [row_to_dict(h) for h in herds]})
 
 
 # ----------------------------------- digital sample & transport tracking -----
@@ -1202,6 +1546,12 @@ def create_sample():
     if not case:
         conn.close()
         return jsonify({"error": "Invalid case ID"}), 404
+    if g.user["role"] == "vet" and not _can_access_case(conn, case, allow_govt=False):
+        conn.close()
+        return jsonify({"error": "This case is assigned outside your authorized jurisdiction"}), 403
+    if g.user["role"] == "owner" and case["owner_id"] != g.user["uid"]:
+        conn.close()
+        return jsonify({"error": "Not authorized"}), 403
 
     animal = conn.execute("SELECT * FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
     district = animal["district"] or "PUN"
@@ -1214,9 +1564,10 @@ def create_sample():
     is_manual = int(data.get("is_manual_location", 0))
 
     if lat is None or lng is None:
-        c_lat, c_lng = fallback_coords(district)
-        lat, lng = c_lat, c_lng
-        is_manual = 1
+        # Location is genuinely unavailable; do not substitute a district
+        # centroid for biological sample GPS.
+        lat = lng = None
+        is_manual = 0
 
     cur = conn.execute(
         """
@@ -1232,6 +1583,7 @@ def create_sample():
          data.get("transporter_name"), data.get("transporter_phone"))
     )
     sample_id = cur.lastrowid
+    emit_event(conn, "LAB_SAMPLE_COLLECTED", {"sample_id": sample_id, "sample_code": sample_code, "status": "SAMPLE_COLLECTED"}, case_id=case["id"], actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"sample-created:{sample_id}")
 
     # Record first custody event
     conn.execute(
@@ -1280,6 +1632,8 @@ def list_samples():
     rows = conn.execute(query, params).fetchall()
     out = []
     for r in rows:
+        if not _can_access_sample(conn, r):
+            continue
         d = dict(r)
         d["qr_image"] = make_qr_image_data_url(d["qr_payload"])
         out.append(d)
@@ -1299,6 +1653,9 @@ def get_sample_detail(sample_id):
     if not sample:
         conn.close()
         return jsonify({"error": "Sample not found"}), 404
+    if not _can_access_sample(conn, sample):
+        conn.close()
+        return jsonify({"error": "Not authorized for this sample"}), 403
 
     events = conn.execute(
         "SELECT * FROM sample_custody_events WHERE sample_id=? ORDER BY id ASC", (sample_id,)
@@ -1337,7 +1694,7 @@ def lookup_sample_qr():
 
 
 @app.post("/api/samples/<int:sample_id>/transport")
-@auth_required(roles=["vet", "lab", "govt"])
+@auth_required(roles=["vet", "lab"])
 def update_sample_transport(sample_id):
     """Advance sample transport lifecycle status and record chain of custody."""
     data = request.get_json(force=True) or {}
@@ -1350,6 +1707,17 @@ def update_sample_transport(sample_id):
     if not sample:
         conn.close()
         return jsonify({"error": "Sample not found"}), 404
+    if not _can_access_sample(conn, sample):
+        conn.close(); return jsonify({"error": "Not authorized for this sample"}), 403
+    transport_transitions = {
+        "COLLECTED": {"READY_FOR_PICKUP"}, "READY_FOR_PICKUP": {"PICKED_UP", "IN_TRANSIT"},
+        "PICKED_UP": {"IN_TRANSIT", "ARRIVED_AT_LAB"}, "IN_TRANSIT": {"ARRIVED_AT_LAB"},
+        "ARRIVED_AT_LAB": set(), "LAB_RECEIVED": set(), "TESTING": set(), "RESULT_READY": set(), "COMPLETED": set(), "REJECTED": set(),
+    }
+    if new_status != sample["status"] and new_status not in transport_transitions.get(sample["status"], set()):
+        conn.close(); return jsonify({"error": f"Invalid sample transition {sample['status']} -> {new_status}"}), 409
+    if g.user["role"] == "lab" and new_status not in {"ARRIVED_AT_LAB"}:
+        conn.close(); return jsonify({"error": "Laboratory staff use receiving/testing workflow for this transition"}), 403
 
     t_name = data.get("transporter_name") or sample["transporter_name"]
     t_phone = data.get("transporter_phone") or sample["transporter_phone"]
@@ -1361,6 +1729,7 @@ def update_sample_transport(sample_id):
         "UPDATE samples SET status=?, transporter_name=?, transporter_phone=?, updated_at=datetime('now') WHERE id=?",
         (new_status, t_name, t_phone, sample_id)
     )
+    emit_event(conn, "LAB_SAMPLE_STATUS_UPDATED", {"sample_id": sample_id, "status": _sample_workflow_status(new_status)}, case_id=sample["case_id"], actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"sample-status:{sample_id}:{new_status}:{data.get('idempotency_key','')}")
 
     action_label = {
         "READY_FOR_PICKUP": "Marked ready for cold-chain transport",
@@ -1425,6 +1794,7 @@ def get_lab_queue():
         ORDER BY s.id DESC
         """
     ).fetchall()
+    samples = [s for s in samples if _can_access_sample(conn, s)]
     conn.close()
 
     out = []
@@ -1450,8 +1820,12 @@ def receive_sample(sample_id):
         conn.close()
         return jsonify({"error": "Sample not found"}), 404
 
+    if not _can_access_sample(conn, sample):
+        conn.close(); return jsonify({"error": "Not authorized for this sample"}), 403
     case = conn.execute("SELECT * FROM cases WHERE id=?", (sample["case_id"],)).fetchone()
     animal = conn.execute("SELECT * FROM animals WHERE id=?", (sample["animal_id"],)).fetchone()
+    if sample["status"] not in {"ARRIVED_AT_LAB", "IN_TRANSIT", "PICKED_UP", "LAB_RECEIVED"}:
+        conn.close(); return jsonify({"error": f"Sample cannot be received from status {sample['status']}"}), 409
 
     if action == "reject":
         if not rejection_reason:
@@ -1462,6 +1836,7 @@ def receive_sample(sample_id):
             "UPDATE samples SET status='REJECTED', rejection_reason=?, updated_at=datetime('now') WHERE id=?",
             (rejection_reason, sample_id)
         )
+        emit_event(conn, "LAB_SAMPLE_STATUS_UPDATED", {"sample_id": sample_id, "status": "RESULT_PENDING", "reason": rejection_reason}, case_id=sample["case_id"], actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"sample-reject:{sample_id}:{rejection_reason}")
         conn.execute(
             """
             INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
@@ -1484,6 +1859,7 @@ def receive_sample(sample_id):
     else:
         # Accept
         conn.execute("UPDATE samples SET status='LAB_RECEIVED', updated_at=datetime('now') WHERE id=?", (sample_id,))
+        emit_event(conn, "LAB_SAMPLE_RECEIVED", {"sample_id": sample_id, "status": "RECEIVED_BY_LAB"}, case_id=sample["case_id"], actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"sample-received:{sample_id}")
         conn.execute(
             """
             INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
@@ -1505,7 +1881,15 @@ def receive_sample(sample_id):
 @auth_required(roles=["lab", "vet"])
 def start_sample_testing(sample_id):
     conn = get_db()
+    sample = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not sample:
+        conn.close(); return jsonify({"error": "Sample not found"}), 404
+    if not _can_access_sample(conn, sample):
+        conn.close(); return jsonify({"error": "Not authorized for this sample"}), 403
+    if sample["status"] not in {"LAB_RECEIVED", "TESTING"}:
+        conn.close(); return jsonify({"error": f"Sample must be LAB_RECEIVED before testing; current status is {sample['status']}"}), 409
     conn.execute("UPDATE samples SET status='TESTING', updated_at=datetime('now') WHERE id=?", (sample_id,))
+    emit_event(conn, "LAB_TEST_STARTED", {"sample_id": sample_id, "status": "TESTING"}, case_id=sample["case_id"], actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"sample-testing:{sample_id}")
     conn.execute(
         """
         INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
@@ -1531,6 +1915,10 @@ def submit_sample_results(sample_id):
     if not sample:
         conn.close()
         return jsonify({"error": "Sample not found"}), 404
+    if not _can_access_sample(conn, sample):
+        conn.close(); return jsonify({"error": "Not authorized for this sample"}), 403
+    if sample["status"] != "TESTING":
+        conn.close(); return jsonify({"error": f"Sample must be TESTING before result entry; current status is {sample['status']}"}), 409
 
     case = conn.execute("SELECT * FROM cases WHERE id=?", (sample["case_id"],)).fetchone()
     report_no = next_code(conn, "LAB", "lab_reports", "report_no")
@@ -1552,7 +1940,10 @@ def submit_sample_results(sample_id):
          data.get("technician_name", g.user["name"]), data.get("comments"), g.user["uid"])
     )
     rep_id = cur.lastrowid
+    conn.execute("UPDATE lab_reports SET current_status='RESULT_READY', report_generated_at=datetime('now'), last_updated_at=datetime('now') WHERE id=?", (rep_id,))
     conn.execute("UPDATE samples SET status='RESULT_READY', updated_at=datetime('now') WHERE id=?", (sample_id,))
+    conn.execute("INSERT INTO lab_report_status_history (report_id,from_status,to_status,actor_id,actor_role,note) VALUES (?,?,?,?,?,?)", (rep_id, "TESTING", "RESULT_READY", g.user["uid"], g.user["role"], data.get("comments")))
+    emit_event(conn, "LAB_RESULT_READY", {"sample_id": sample_id, "report_id": rep_id, "status": "RESULT_READY", "result": result_val}, case_id=case["id"], actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"lab-result:{rep_id}")
     conn.execute(
         """
         INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
@@ -1578,15 +1969,22 @@ def verify_lab_report(report_id):
 
     case = conn.execute("SELECT * FROM cases WHERE id=?", (rep["case_id"],)).fetchone()
     animal = conn.execute("SELECT * FROM animals WHERE id=?", (rep["animal_id"],)).fetchone()
+    if g.user["role"] == "vet" and not _can_access_case(conn, case, allow_govt=False):
+        conn.close(); return jsonify({"error": "Not authorized for this laboratory report"}), 403
+    if rep["verification_status"] == "VERIFIED":
+        conn.close(); return jsonify(row_to_dict(rep))
 
     conn.execute(
         """
         UPDATE lab_reports
-        SET verification_status='VERIFIED', verified_by=?, verified_at=datetime('now'), published_at=datetime('now')
+        SET verification_status='VERIFIED', current_status='REPORT_SENT_TO_VET', verified_by=?, verified_at=datetime('now'), published_at=datetime('now'), report_generated_at=COALESCE(report_generated_at, datetime('now')), last_updated_at=datetime('now')
         WHERE id=?
         """,
         (g.user["uid"], report_id)
     )
+
+    conn.execute("INSERT INTO lab_report_status_history (report_id,from_status,to_status,actor_id,actor_role,note) VALUES (?,?,?,?,?,?)", (report_id, rep["current_status"] or "RESULT_READY", "REPORT_SENT_TO_VET", g.user["uid"], g.user["role"], "Report verified and released"))
+    emit_event(conn, "LAB_REPORT_SUBMITTED", {"report_id": report_id, "report_no": rep["report_no"], "status": "REPORT_SENT_TO_VET", "result": rep["result"]}, case_id=rep["case_id"], actor_id=g.user["uid"], actor_role=g.user["role"], idempotency_key=f"lab-report-submitted:{report_id}")
 
     if rep["sample_id"]:
         conn.execute("UPDATE samples SET status='COMPLETED', updated_at=datetime('now') WHERE id=?", (rep["sample_id"],))
@@ -1602,7 +2000,13 @@ def verify_lab_report(report_id):
     # 1. Notify Veterinarian
     if case["vet_id"]:
         vet_msg = f"🧪 Verified Lab Report {rep['report_no']} is ready for Case {case['case_no']} (Animal {animal['animal_code']}, Test: {rep['test_name']}, Result: {rep['result']})."
-        notify(conn, case["vet_id"], vet_msg, "lab")
+        notify(conn, case["vet_id"], vet_msg, "lab", case_id=case["id"], event_type="LAB_REPORT_SUBMITTED")
+
+    # Critical/positive findings are also escalated to authorised government
+    # users; only the case number and clinical result are shared here.
+    if str(rep["result"] or "").upper() in {"POSITIVE", "CRITICAL", "ABNORMAL"} or str(rep["abnormal_flag"] or "").lower() not in {"normal", ""}:
+        for official in conn.execute("SELECT id FROM users WHERE role='govt'").fetchall():
+            notify(conn, official["id"], f"Critical laboratory result {rep['report_no']} for case {case['case_no']} in {animal['district'] or 'unknown'}.", "lab", case_id=case["id"], event_type="CRITICAL_LAB_RESULT")
 
     # 2. Notify Owner
     owner_msg = f"🧪 Laboratory report {rep['report_no']} for your animal {animal['animal_code']} (Case {case['case_no']}) has been released."
@@ -1649,18 +2053,17 @@ def create_lab_request():
 @auth_required()
 def list_lab_reports():
     conn = get_db()
+    rows = conn.execute(
+        "SELECT l.*, a.animal_code, a.animal_name, c.case_no, c.owner_id FROM lab_reports l "
+        "JOIN animals a ON a.id=l.animal_id JOIN cases c ON c.id=l.case_id "
+        "ORDER BY l.id DESC"
+    ).fetchall()
     if g.user["role"] == "owner":
-        rows = conn.execute(
-            "SELECT l.*, a.animal_code, a.animal_name, c.case_no FROM lab_reports l "
-            "JOIN animals a ON a.id=l.animal_id JOIN cases c ON c.id=l.case_id "
-            "WHERE a.owner_id=? ORDER BY l.id DESC", (g.user["uid"],)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT l.*, a.animal_code, a.animal_name, c.case_no FROM lab_reports l "
-            "JOIN animals a ON a.id=l.animal_id JOIN cases c ON c.id=l.case_id "
-            "ORDER BY l.id DESC"
-        ).fetchall()
+        rows = [r for r in rows if r["owner_id"] == g.user["uid"]]
+    elif g.user["role"] in ("vet", "govt"):
+        rows = [r for r in rows if _can_access_case(conn, _case_for_visit(conn, r["case_id"]), allow_govt=True)]
+    elif g.user["role"] != "lab":
+        rows = []
     conn.close()
     return jsonify([row_to_dict(r) for r in rows])
 
@@ -1674,6 +2077,8 @@ def create_lab_report():
     if not case:
         conn.close()
         return jsonify({"error": "Invalid case ID"}), 404
+    if g.user["role"] == "vet" and case["vet_id"] not in (None, g.user["uid"]):
+        conn.close(); return jsonify({"error": "This case is assigned to another veterinarian"}), 403
 
     animal = conn.execute("SELECT * FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
     report_no = next_code(conn, "LAB", "lab_reports", "report_no")
@@ -1715,6 +2120,221 @@ def create_lab_report():
     rep = conn.execute("SELECT * FROM lab_reports WHERE id=?", (rep_id,)).fetchone()
     conn.close()
     return jsonify(row_to_dict(rep)), 201
+
+
+# ------------------------------------------ veterinarian laboratory tracking ---
+LAB_REPORT_STATUSES = {
+    "SAMPLE_COLLECTED", "SAMPLE_IN_TRANSIT", "RECEIVED_BY_LAB", "TESTING",
+    "RESULT_PENDING", "RESULT_READY", "REPORT_REVIEWED", "REPORT_SENT_TO_VET",
+    "VET_ACTION_REQUIRED", "CASE_RESOLVED",
+}
+
+
+def _sample_workflow_status(sample_status, verification_status=None, report_status=None):
+    if verification_status == "VERIFIED":
+        return "REPORT_SENT_TO_VET"
+    if report_status in LAB_REPORT_STATUSES:
+        return report_status
+    return {
+        "COLLECTED": "SAMPLE_COLLECTED", "READY_FOR_PICKUP": "SAMPLE_IN_TRANSIT",
+        "PICKED_UP": "SAMPLE_IN_TRANSIT", "IN_TRANSIT": "SAMPLE_IN_TRANSIT",
+        "ARRIVED_AT_LAB": "RECEIVED_BY_LAB", "LAB_RECEIVED": "RECEIVED_BY_LAB",
+        "TESTING": "TESTING", "RESULT_READY": "RESULT_READY", "COMPLETED": "REPORT_SENT_TO_VET",
+        "REJECTED": "RESULT_PENDING",
+    }.get(sample_status, "RESULT_PENDING")
+
+
+def _lab_report_row(conn, row):
+    d = dict(row)
+    d["current_status"] = _sample_workflow_status(d.get("sample_status"), d.get("verification_status"), d.get("current_status"))
+    d["report_generated_at"] = d.get("report_generated_at") or d.get("published_at") or d.get("report_created_at") or d.get("created_at")
+    d["last_updated_at"] = d.get("last_updated_at") or d.get("sample_updated_at") or d.get("report_created_at") or d.get("created_at")
+    d["report_id"] = d.get("report_id") or d.get("id")
+    d["report_no"] = d.get("report_no") or None
+    # Privacy: callers of this helper are already RBAC checked. Phone is
+    # included for a veterinarian assigned to the case and govt visibility.
+    d["farmer_phone"] = d.get("farmer_phone")
+    return d
+
+
+def _vet_lab_where(conn):
+    actor = conn.execute("SELECT district FROM users WHERE id=?", (g.user["uid"],)).fetchone()
+    district = (actor["district"] if actor else None) or ""
+    if g.user["role"] == "vet":
+        if district:
+            return "AND (c.vet_id=? OR (c.vet_id IS NULL AND LOWER(COALESCE(a.district,''))=LOWER(?)))", [g.user["uid"], district]
+        return "AND (c.vet_id=? OR c.vet_id IS NULL)", [g.user["uid"]]
+    if g.user["role"] == "govt":
+        return ("AND LOWER(COALESCE(a.district,''))=LOWER(?)", [district]) if district else ("", [])
+    return "AND 1=0", []
+
+
+LAB_TRACK_QUERY = """
+SELECT s.id sample_id, s.sample_code, s.qr_token, s.status sample_status,
+       s.collected_at sample_collection_at, s.updated_at sample_updated_at,
+       s.case_id, c.case_no, c.symptoms, c.disease_suspected, c.severity,
+       c.vet_id assigned_vet_id, c.created_at case_created_at,
+       a.animal_type, a.species animal_species, a.animal_name, a.village,
+       a.block, a.district, a.owner_id, owner.full_name farmer_name, owner.mobile farmer_phone,
+       av.full_name assigned_veterinarian, COALESCE(lab.full_name, (SELECT full_name FROM users WHERE role='lab' ORDER BY id LIMIT 1)) laboratory,
+       lr.test_requested test_type, lr.priority request_priority,
+       r.id report_id, r.report_no, r.test_name, r.result, r.notes report_notes,
+       r.verification_status, r.current_status, r.test_date,
+       r.report_generated_at, r.last_updated_at, r.published_at, r.created_at report_created_at
+FROM samples s
+JOIN cases c ON c.id=s.case_id
+JOIN animals a ON a.id=s.animal_id
+JOIN users owner ON owner.id=c.owner_id
+LEFT JOIN users av ON av.id=c.vet_id
+LEFT JOIN lab_requests lr ON lr.id=s.lab_request_id
+LEFT JOIN lab_reports r ON r.sample_id=s.id
+LEFT JOIN users lab ON lab.id=r.entered_by
+WHERE 1=1
+"""
+
+
+@app.get("/api/veterinarian/lab-reports")
+@auth_required(roles=["vet", "govt"])
+def veterinarian_lab_reports():
+    conn = get_db()
+    where, params = _vet_lab_where(conn)
+    query = LAB_TRACK_QUERY + " " + where
+    filters = []
+    q = (request.args.get("q") or request.args.get("search") or "").strip()
+    if q:
+        query += " AND (c.case_no LIKE ? OR s.sample_code LIKE ? OR COALESCE(r.report_no,'') LIKE ? OR owner.full_name LIKE ? OR owner.mobile LIKE ? OR COALESCE(c.disease_suspected,'') LIKE ?)"
+        filters += [f"%{q}%"] * 6
+    for arg, col in (("district", "a.district"), ("disease", "c.disease_suspected"), ("laboratory", "lab.full_name")):
+        val = (request.args.get(arg) or "").strip()
+        if val:
+            query += f" AND LOWER(COALESCE({col},''))=LOWER(?)"; filters.append(val)
+    priority = (request.args.get("priority") or "").strip()
+    if priority:
+        query += " AND LOWER(COALESCE(lr.priority,''))=LOWER(?)"; filters.append(priority)
+    status = (request.args.get("status") or "").strip().upper()
+    if status in LAB_REPORT_STATUSES:
+        # Status is normalized in Python because legacy sample rows and the
+        # report lifecycle coexist during migration.
+        pass
+    date_from, date_to = request.args.get("date_from"), request.args.get("date_to")
+    if date_from:
+        query += " AND date(COALESCE(s.collected_at,s.created_at)) >= date(?)"; filters.append(date_from)
+    if date_to:
+        query += " AND date(COALESCE(s.collected_at,s.created_at)) <= date(?)"; filters.append(date_to)
+    sort = request.args.get("sort", "updated").lower()
+    order = {"date": "COALESCE(s.collected_at,s.created_at)", "priority": "COALESCE(lr.priority,'Normal')", "status": "s.status", "updated": "COALESCE(r.last_updated_at,s.updated_at)"}.get(sort, "COALESCE(r.last_updated_at,s.updated_at)")
+    direction = "ASC" if request.args.get("order", "desc").lower() == "asc" else "DESC"
+    query += f" ORDER BY {order} {direction} LIMIT 500"
+    rows = conn.execute(query, params + filters).fetchall()
+    out = [_lab_report_row(conn, r) for r in rows]
+    # Legacy report-entry API permits a report without a linked sample. Keep
+    # those records visible in the veterinary lifecycle instead of silently
+    # dropping them during the additive sample migration.
+    legacy = conn.execute("""
+        SELECT r.*, c.case_no, c.symptoms, c.disease_suspected, c.severity, c.vet_id assigned_vet_id,
+               c.created_at case_created_at, a.animal_type, a.species animal_species, a.animal_name,
+               a.village, a.block, a.district, a.owner_id, owner.full_name farmer_name, owner.mobile farmer_phone,
+               av.full_name assigned_veterinarian, COALESCE(lab.full_name,(SELECT full_name FROM users WHERE role='lab' ORDER BY id LIMIT 1)) laboratory,
+               lr.test_requested test_type, lr.priority request_priority
+        FROM lab_reports r JOIN cases c ON c.id=r.case_id JOIN animals a ON a.id=r.animal_id
+        JOIN users owner ON owner.id=c.owner_id LEFT JOIN users av ON av.id=c.vet_id
+        LEFT JOIN lab_requests lr ON lr.id=r.lab_request_id LEFT JOIN users lab ON lab.id=r.entered_by
+        WHERE r.sample_id IS NULL
+    """ + " " + where, params).fetchall()
+    for r in legacy:
+        d = dict(r)
+        d.update({"sample_id": None, "sample_code": d.get("sample") or "Not linked", "qr_token": None,
+                  "sample_status": None, "sample_collection_at": d.get("test_date"), "sample_updated_at": d.get("created_at"),
+                  "report_id": d.get("id"), "report_created_at": d.get("created_at")})
+        out.append(_lab_report_row(conn, d))
+    if status in LAB_REPORT_STATUSES:
+        out = [r for r in out if r["current_status"] == status]
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/veterinarian/lab-reports/<int:report_id>")
+@auth_required(roles=["vet", "govt"])
+def veterinarian_lab_report_detail(report_id):
+    conn = get_db()
+    row = conn.execute(LAB_TRACK_QUERY.replace("WHERE 1=1", "WHERE (r.id=? OR (r.id IS NULL AND s.id=?))"), (report_id, report_id)).fetchone()
+    if not row:
+        # Details for a legacy report created without a digital sample.
+        row = conn.execute("""
+            SELECT r.*, c.case_no, c.symptoms, c.disease_suspected, c.severity, c.vet_id assigned_vet_id,
+                   c.created_at case_created_at, a.animal_type, a.species animal_species, a.animal_name,
+                   a.village, a.block, a.district, a.owner_id, owner.full_name farmer_name, owner.mobile farmer_phone,
+                   av.full_name assigned_veterinarian, COALESCE(lab.full_name,(SELECT full_name FROM users WHERE role='lab' ORDER BY id LIMIT 1)) laboratory,
+                   lr.test_requested test_type, lr.priority request_priority
+            FROM lab_reports r JOIN cases c ON c.id=r.case_id JOIN animals a ON a.id=r.animal_id
+            JOIN users owner ON owner.id=c.owner_id LEFT JOIN users av ON av.id=c.vet_id
+            LEFT JOIN lab_requests lr ON lr.id=r.lab_request_id LEFT JOIN users lab ON lab.id=r.entered_by
+            WHERE r.id=? AND r.sample_id IS NULL
+        """, (report_id,)).fetchone()
+    if not row:
+        conn.close(); return jsonify({"error": "Laboratory report not found"}), 404
+    case = _case_for_visit(conn, row["case_id"])
+    if not _can_access_case(conn, case, allow_govt=True):
+        conn.close(); return jsonify({"error": "Not authorized for this laboratory report"}), 403
+    result = _lab_report_row(conn, row)
+    result["timeline"] = [dict(x) for x in conn.execute("SELECT * FROM lab_report_status_history WHERE report_id=? ORDER BY id", (report_id,)).fetchall()]
+    result["audit_history"] = [dict(x) for x in conn.execute("SELECT * FROM audit_events WHERE entity_type='lab_report' AND entity_id=? ORDER BY id", (str(report_id),)).fetchall()]
+    result["result_history"] = [dict(x) for x in conn.execute("SELECT id,report_no,test_name,result,verification_status,created_at,verified_at,published_at FROM lab_reports WHERE case_id=? ORDER BY id", (row["case_id"],)).fetchall()]
+    conn.close(); return jsonify(result)
+
+
+@app.patch("/api/lab-reports/<int:report_id>/status")
+@auth_required(roles=["vet", "lab", "govt"])
+def update_lab_report_status(report_id):
+    data = request.get_json(force=True) or {}
+    new_status = str(data.get("status") or "").upper()
+    if new_status not in LAB_REPORT_STATUSES:
+        return jsonify({"error": "Unsupported laboratory report status"}), 400
+    conn = get_db()
+    report = conn.execute("SELECT * FROM lab_reports WHERE id=?", (report_id,)).fetchone()
+    if not report:
+        conn.close(); return jsonify({"error": "Laboratory report not found"}), 404
+    case = _case_for_visit(conn, report["case_id"])
+    if g.user["role"] != "lab" and not _can_access_case(conn, case, allow_govt=True):
+        conn.close(); return jsonify({"error": "Not authorized for this report"}), 403
+    lab_allowed = {"REPORT_REVIEWED", "REPORT_SENT_TO_VET"}
+    vet_allowed = {"REPORT_REVIEWED", "VET_ACTION_REQUIRED", "CASE_RESOLVED"}
+    allowed = lab_allowed if g.user["role"] == "lab" else vet_allowed
+    if new_status not in allowed:
+        conn.close(); return jsonify({"error": f"Role {g.user['role']} cannot transition to {new_status}"}), 403
+    old = report["current_status"] or _sample_workflow_status(None, report["verification_status"])
+    permitted = {
+        "RESULT_PENDING": {"RESULT_READY", "REPORT_REVIEWED", "REPORT_SENT_TO_VET"},
+        "RESULT_READY": {"REPORT_REVIEWED", "REPORT_SENT_TO_VET"},
+        "REPORT_REVIEWED": {"REPORT_SENT_TO_VET"},
+        "REPORT_SENT_TO_VET": {"REPORT_REVIEWED", "VET_ACTION_REQUIRED", "CASE_RESOLVED"},
+        "VET_ACTION_REQUIRED": {"CASE_RESOLVED"},
+        "CASE_RESOLVED": set(),
+    }
+    if new_status != old and new_status not in permitted.get(old, set()):
+        conn.close(); return jsonify({"error": f"Invalid report transition {old} -> {new_status}"}), 409
+    conn.execute("UPDATE lab_reports SET current_status=?, last_updated_at=datetime('now') WHERE id=?", (new_status, report_id))
+    conn.execute("INSERT INTO lab_report_status_history (report_id,from_status,to_status,actor_id,actor_role,note) VALUES (?,?,?,?,?,?)",
+                 (report_id, old, new_status, g.user["uid"], g.user["role"], data.get("note")))
+    emit_event(conn, "LAB_REPORT_STATUS_UPDATED", {"report_id": report_id, "from_status": old, "status": new_status}, case_id=report["case_id"], actor_id=g.user["uid"], actor_role=g.user["role"],
+               idempotency_key=f"lab-status:{report_id}:{new_status}:{data.get('idempotency_key','')}")
+    if case and case["vet_id"] and new_status in ("RESULT_READY", "REPORT_SENT_TO_VET", "VET_ACTION_REQUIRED"):
+        notify(conn, case["vet_id"], f"Laboratory report {report['report_no']} status: {new_status}.", "lab", case_id=report["case_id"], event_type="LAB_REPORT_STATUS_UPDATED")
+    if case and new_status == "CASE_RESOLVED":
+        conn.execute("UPDATE cases SET status='CLOSED', updated_at=datetime('now') WHERE id=?", (case["id"],))
+    audit_log(conn, "UPDATE_LAB_REPORT_STATUS", "lab_report", report_id, actor_id=g.user["uid"], actor_name=g.user["name"], actor_role=g.user["role"], details={"from": old, "to": new_status})
+    conn.commit(); result = dict(conn.execute("SELECT * FROM lab_reports WHERE id=?", (report_id,)).fetchone()); conn.close(); return jsonify(result)
+
+
+@app.get("/api/veterinarian/lab-reports/<int:report_id>/download")
+@auth_required(roles=["vet", "govt"])
+def download_lab_report(report_id):
+    response = veterinarian_lab_report_detail.__wrapped__(report_id)
+    if getattr(response, "status_code", 200) != 200:
+        return response
+    data = response.get_json()
+    lines = ["Pashu-Shield Laboratory Report", f"Report ID: {data.get('report_no') or report_id}", f"Case ID: {data.get('case_no')}", f"Sample ID: {data.get('sample_code')}", f"Current status: {data.get('current_status')}", f"Farmer: {data.get('farmer_name')}", f"Disease suspected: {data.get('disease_suspected')}", f"Test: {data.get('test_name') or data.get('test_type')}", f"Result: {data.get('result') or 'Pending'}", f"Generated: {data.get('report_generated_at')}", "", "This report is an authenticated application export."]
+    return Response("\n".join(str(x or "") for x in lines), mimetype="text/plain", headers={"Content-Disposition": f"attachment; filename=lab-report-{report_id}.txt"})
 
 
 # --------------------------------------------------------- prescriptions --
@@ -1930,6 +2550,171 @@ def mark_notification_read(note_id):
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
+
+
+@app.post("/api/notifications")
+@auth_required(roles=["owner", "vet", "govt", "lab"])
+def create_notification():
+    data = request.get_json(force=True) or {}
+    recipient_id = data.get("recipient_id", data.get("user_id"))
+    try: recipient_id = int(recipient_id)
+    except (TypeError, ValueError): return jsonify({"error": "recipient_id is required"}), 400
+    message = str(data.get("message") or "").strip()
+    if not message: return jsonify({"error": "message is required"}), 400
+    channels = data.get("channels") or ["in_app"]
+    if isinstance(channels, str): channels = [channels]
+    channels = [str(c).lower() for c in channels]
+    if any(c not in {"in_app", "sms", "whatsapp", "push"} for c in channels):
+        return jsonify({"error": "unsupported notification channel"}), 400
+    conn = get_db()
+    recipient = conn.execute("SELECT id,role,mobile FROM users WHERE id=?", (recipient_id,)).fetchone()
+    if not recipient: conn.close(); return jsonify({"error": "recipient not found"}), 404
+    # No caller may use this endpoint to escalate visibility beyond RBAC.
+    if g.user["role"] == "owner" and recipient_id != g.user["uid"]:
+        conn.close(); return jsonify({"error": "owners may notify only their own account"}), 403
+    case_id = data.get("case_id")
+    if case_id:
+        case = _case_for_visit(conn, int(case_id))
+        if not case or not _can_access_case(conn, case):
+            conn.close(); return jsonify({"error": "not authorized for case"}), 403
+        # The recipient must also have a legitimate relationship to the case;
+        # a caller cannot use notifications as an information side channel.
+        recipient_allowed = recipient_id == case["owner_id"]
+        if recipient["role"] == "vet":
+            recipient_allowed = recipient_allowed or recipient_id == case["vet_id"]
+        if recipient["role"] in {"govt", "lab"}:
+            recipient_allowed = True
+        if not recipient_allowed:
+            conn.close(); return jsonify({"error": "recipient is not authorized for this case"}), 403
+    event_type = str(data.get("event_type") or "NOTIFICATION_CREATED").upper()
+    if not re.match(r"^[A-Z][A-Z0-9_]{2,80}$", event_type):
+        conn.close(); return jsonify({"error": "invalid event_type"}), 400
+    base_idem = str(data.get("idempotency_key") or f"manual:{recipient_id}:{event_type}:{message}")
+    results = []
+    # In-app is durable and immediately visible.
+    if "in_app" in channels:
+        nid = notify(conn, recipient_id, message, str(data.get("type") or "info"), case_id=case_id, event_type=event_type, data=data.get("data"), idempotency_key=base_idem + ":in_app")
+        results.append({"channel": "in_app", "status": "DELIVERED", "notification_id": nid})
+    sms = SMSProvider()
+    if "sms" in channels:
+        sms_key = base_idem + ":sms"
+        existing_sms = conn.execute("SELECT delivery_status,retry_count,error_info FROM notifications WHERE idempotency_key=?", (sms_key,)).fetchone()
+        if existing_sms:
+            results.append({"channel": "sms", "status": existing_sms["delivery_status"], "error": existing_sms["error_info"], "attempts": existing_sms["retry_count"], "duplicate": True})
+        else:
+            result = sms.send(to=recipient["mobile"], message=message, reference=sms_key)
+            conn.execute("INSERT OR IGNORE INTO notifications (user_id,message,type,event_id,idempotency_key,recipient_role,channel,delivery_status,retry_count,error_info,case_id,data_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (recipient_id, message, str(data.get("type") or "info"), None, sms_key, recipient["role"], "sms", result.status, result.attempts, result.error, case_id, json.dumps(data.get("data") or {})))
+            results.append({"channel": "sms", "status": result.status, "provider": result.provider, "error": result.error, "attempts": result.attempts})
+    for channel in (c for c in channels if c in {"whatsapp", "push"}):
+        configured = provider_health().get(channel, {}).get("configured", False)
+        status = "NOT_CONFIGURED" if not configured else "UNSUPPORTED_PROVIDER_ADAPTER"
+        conn.execute("INSERT OR IGNORE INTO notifications (user_id,message,type,idempotency_key,recipient_role,channel,delivery_status,error_info,case_id,data_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (recipient_id, message, str(data.get("type") or "info"), base_idem + ":" + channel, recipient["role"], channel, status, None if configured else f"{channel} provider is not configured", case_id, json.dumps(data.get("data") or {})))
+        results.append({"channel": channel, "status": status})
+    conn.commit(); conn.close()
+    return jsonify({"event_type": event_type, "idempotency_key": base_idem, "deliveries": results}), 201
+
+
+@app.get("/api/realtime/token")
+@auth_required()
+def realtime_token():
+    """Mint a short-lived token for browser EventSource authentication."""
+    payload = {
+        "uid": g.user["uid"], "role": g.user["role"], "name": g.user["name"],
+        "purpose": "realtime", "exp": datetime.utcnow() + timedelta(minutes=10),
+    }
+    return jsonify({"token": jwt.encode(payload, SECRET_KEY, algorithm="HS256"), "expires_in": 600})
+
+
+@app.get("/api/realtime/events")
+@auth_required()
+def realtime_events():
+    """Replay persisted events for reconnecting clients."""
+    conn = get_db(); limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+    since = request.args.get("since")
+    query = "SELECT * FROM realtime_events WHERE 1=1"; params = []
+    if since:
+        query += " AND event_id != ?"; params.append(since)
+    query += " ORDER BY created_at DESC LIMIT ?"; params.append(limit)
+    rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+    visible = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if payload.get("recipient_id") is not None and int(payload["recipient_id"]) != g.user["uid"]:
+            continue
+        if row["case_id"]:
+            case = _case_for_visit(conn, row["case_id"])
+            if not case or not _can_access_case(conn, case):
+                continue
+        elif payload.get("recipient_id") is None and g.user["role"] != "govt":
+            continue
+        visible.append(row)
+    conn.close()
+    for row in visible:
+        try: row["payload"] = json.loads(row["payload"])
+        except (TypeError, ValueError): pass
+    return jsonify(list(reversed(visible)))
+
+
+@app.get("/api/realtime/stream")
+@auth_required()
+def realtime_stream():
+    """Server-Sent Events stream backed by database events.
+
+    Query-string authentication is accepted only for the short-lived token
+    minted by ``/api/realtime/token``; normal API tokens are not placed in the
+    stream URL.
+
+    The repository has no WebSocket server dependency. SSE provides a real
+    authenticated server push channel over the existing Flask deployment; it
+    is reconnectable and emits only committed events. A future WebSocket
+    adapter can consume the same realtime_events table without changing APIs.
+    """
+    if request.args.get("access_token") and g.user.get("purpose") != "realtime":
+        return jsonify({"error": "A short-lived realtime token is required"}), 401
+    user = dict(g.user)
+    last_seen = request.args.get("since") or request.headers.get("Last-Event-ID")
+
+    @stream_with_context
+    def generate():
+        yield "retry: 3000\n\n"
+        seen = set()
+        resume_found = not bool(last_seen)
+        # Bound the stream so workers are not held forever by abandoned tabs.
+        for _ in range(60):
+            conn = get_db()
+            rows = conn.execute("SELECT * FROM realtime_events ORDER BY created_at ASC, event_id ASC LIMIT 500").fetchall()
+            for row in rows:
+                if not resume_found:
+                    if row["event_id"] == last_seen:
+                        resume_found = True
+                    continue
+                if row["event_id"] in seen: continue
+                try:
+                    payload = json.loads(row["payload"] or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+                if payload.get("recipient_id") is not None and int(payload["recipient_id"]) != user["uid"]:
+                    continue
+                if row["case_id"]:
+                    case = _case_for_visit(conn, row["case_id"])
+                    if not case or not _can_access_case_for_user(conn, case, user): continue
+                elif payload.get("recipient_id") is None and user["role"] != "govt":
+                    continue
+                seen.add(row["event_id"])
+                yield f"id: {row['event_id']}\nevent: {row['event_type']}\ndata: {json.dumps({'event_id': row['event_id'], 'event_type': row['event_type'], 'timestamp': row['created_at'], 'case_id': row['case_id'], 'actor_id': row['actor_id'], 'actor_role': row['actor_role'], 'payload': payload}, ensure_ascii=False)}\n\n"
+            # If the browser resumed after an event outside the bounded replay
+            # window, replay the retained window once rather than stalling.
+            if not resume_found:
+                resume_found = True
+            conn.close()
+            import time as _time; _time.sleep(1)
+        yield ": stream-closed\n\n"
+    return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ------------------------------------------------------------ summaries --
@@ -2800,9 +3585,38 @@ if HAS_IVR:
         import traceback; traceback.print_exc()
 
 # Ensure all existing /api cases include IVR source visibility (already via reported_through field)
+def _health_payload():
+    db_status = "ok"
+    try:
+        conn = get_db(); conn.execute("SELECT 1").fetchone(); conn.close()
+    except Exception:
+        db_status = "error"
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    return {"status": "ok" if db_status == "ok" else "degraded", "database": db_status,
+            "redis": {"configured": bool(redis_url), "status": "not_checked" if redis_url else "not_configured"},
+            "realtime": {"transport": "sse", "status": "available"},
+            "ivr": HAS_IVR, "version": "1.1"}
+
+
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "ivr": HAS_IVR, "version": "1.0"})
+    return jsonify(_health_payload())
+
+
+@app.get("/health")
+def health_root():
+    return jsonify(_health_payload())
+
+
+@app.get("/health/integrations")
+def integrations_health():
+    return jsonify({"sms": provider_health()["sms"],
+                    "whatsapp": provider_health()["whatsapp"],
+                    "push": provider_health()["push"],
+                    "map": {"provider": os.environ.get("MAP_PROVIDER", ""), "configured": bool(os.environ.get("MAP_PROVIDER"))},
+                    "translation": {"provider": os.environ.get("TRANSLATION_PROVIDER", "builtin"), "configured": True},
+                    "telephony": {"provider": os.environ.get("TELEPHONY_PROVIDER", "mock"), "configured": HAS_IVR},
+                    "ai": {"configured": bool(os.environ.get("SIH_ML_BACKEND"))}})
 
 @app.get("/api/ivr/info")
 def ivr_info_public():

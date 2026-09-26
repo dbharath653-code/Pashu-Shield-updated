@@ -273,6 +273,17 @@ def _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, c
             vets = conn.execute("SELECT id FROM users WHERE role='vet' LIMIT 3").fetchall()
         species = normalized.get("species") or "Animal"
         main_problem = normalized.get("main_problem") or "Health issue"
+        case_event_id = None
+        if case_id:
+            candidate_event_id = str(uuid.uuid4())
+            conn.execute("INSERT OR IGNORE INTO realtime_events (event_id,event_type,schema_version,case_id,actor_role,payload,idempotency_key) VALUES (?,?,?,?,?,?,?)",
+                         (candidate_event_id, "HELPLINE_CASE_CREATED", 1, case_id, "system", json.dumps({"report_id": report_id, "report_no": report_no, "urgency": urgency, "channel": channel}), f"helpline-case:{case_id}"))
+            existing_event = conn.execute("SELECT event_id FROM realtime_events WHERE idempotency_key=?", (f"helpline-case:{case_id}",)).fetchone()
+            case_event_id = existing_event["event_id"] if existing_event else candidate_event_id
+        def insert_note(user_id, message, role, key):
+            conn.execute("INSERT OR IGNORE INTO notifications (user_id,message,type,event_id,idempotency_key,recipient_role,channel,delivery_status,case_id,data_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         (user_id, message, "case", case_event_id, key, role, "in_app", "DELIVERED", case_id,
+                          json.dumps({"report_id": report_id, "report_no": report_no, "urgency": urgency, "channel": channel})))
         lang_note = ""
         try:
             sess_lang = conn.execute("SELECT language FROM ivr_sessions WHERE call_sid=(SELECT call_sid FROM ivr_reports WHERE id=?)", (report_id,)).fetchone()
@@ -286,16 +297,16 @@ def _notify_vet_and_govt(conn, report_id, report_no, normalized, loc, urgency, c
                 row = conn.execute('SELECT case_no FROM cases WHERE id=?', (case_id,)).fetchone()
                 if row:
                     msg += f" | Case: {row['case_no']}"
-            conn.execute("INSERT INTO notifications (user_id, message, type) VALUES (?,?,?)", (v["id"], msg, "case"))
+            insert_note(v["id"], msg, "vet", f"ivr-notification:{report_id}:vet:{v['id']}")
         govts = conn.execute("SELECT id FROM users WHERE role='govt' LIMIT 5").fetchall()
         for g in govts:
             msg = f"📊 {channel} report {report_no} received: {species} in {district or 'Unknown'} | Urgency: {urgency}{lang_note} | Total affected: {normalized.get('animal_count') or 1}"
-            conn.execute("INSERT INTO notifications (user_id, message, type) VALUES (?,?,?)", (g["id"], msg, "case"))
+            insert_note(g["id"], msg, "govt", f"ivr-notification:{report_id}:govt:{g['id']}")
         if caller_norm:
             owner = conn.execute("SELECT id FROM users WHERE mobile=?", (caller_norm,)).fetchone()
             if owner:
                 msg = f"✅ Your {channel} report {report_no} has been received and sent to veterinary team. Urgency: {urgency}. You will be contacted if follow-up is needed."
-                conn.execute("INSERT INTO notifications (user_id, message, type) VALUES (?,?,?)", (owner["id"], msg, "case"))
+                insert_note(owner["id"], msg, "owner", f"ivr-notification:{report_id}:owner:{owner['id']}")
     except Exception as e:
         print(f"_notify failed: {e}")
 

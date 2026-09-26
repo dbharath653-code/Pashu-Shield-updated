@@ -943,10 +943,15 @@ def register_ivr_routes(app):
         lng = request.args.get("lng") or data.get("lng") or request.form.get("lng")
         if not call_sid or not lat or not lng:
             return jsonify({"error": "call_sid, lat, lng required"}), 400
-        # Validate token (simple hash check)
-        # If token invalid, still accept but log warning
         conn = get_db()
         call = conn.execute("SELECT * FROM ivr_calls WHERE call_sid=?", (call_sid,)).fetchone()
+        # Signed links are bound to call SID + caller number + server secret.
+        # The legacy test token is accepted only for mock calls; real PBX calls
+        # always require the signed value.
+        expected = hashlib.sha256(f"{call_sid}:{call['caller_number_normalized'] if call else ''}:{os.environ.get('SIH_SECRET_KEY', 'dev-secret')}".encode()).hexdigest()[:16]
+        if call and token != expected and not (call["is_mock"] and token == "test"):
+            conn.close()
+            return jsonify({"error": "invalid or expired location token"}), 403
         if not call:
             conn.close()
             return jsonify({"error": "Call not found"}), 404
@@ -970,8 +975,20 @@ def register_ivr_routes(app):
                     "INSERT INTO ivr_survey_responses (call_sid, session_id, question_key, answer_raw, answer_normalized, answer_source, language) VALUES (?,?,?,?,?,?,?)",
                     (call_sid, session["id"] if session else None, "location_source", "GPS", "GPS", "manual", session["language"] if session else "en")
                 )
-                # Also update ivr_reports if already created
+                # Also update ivr_reports if already created and propagate the
+                # same authorised observation to the linked case/dashboards.
                 conn.execute("UPDATE ivr_reports SET location_lat=?, location_lng=?, location_source='GPS', location_accuracy='High - SMS link GPS consent' WHERE call_sid=?", (lat_f, lng_f, call_sid))
+                linked = conn.execute("SELECT id,case_id FROM ivr_reports WHERE call_sid=? ORDER BY id DESC LIMIT 1", (call_sid,)).fetchone()
+                if linked and linked["case_id"]:
+                    conn.execute("UPDATE case_locations SET is_current=0 WHERE case_id=?", (linked["case_id"],))
+                    conn.execute("INSERT INTO case_locations (case_id,source,latitude,longitude,accuracy_m,captured_by) VALUES (?, 'GPS', ?, ?, ?, ?)", (linked["case_id"], lat_f, lng_f, None, session["caller_user_id"] if session else None))
+                    event_id = str(uuid.uuid4())
+                    conn.execute("INSERT OR IGNORE INTO realtime_events (event_id,event_type,case_id,actor_role,payload,idempotency_key) VALUES (?,?,?,?,?,?)", (event_id, "HELPLINE_LOCATION_UPDATED", linked["case_id"], "farmer", json.dumps({"call_sid": call_sid, "source": "GPS"}), f"ivr-location:{call_sid}:{lat_f}:{lng_f}"))
+                    case = conn.execute("SELECT case_no,owner_id,vet_id FROM cases WHERE id=?", (linked["case_id"],)).fetchone()
+                    if case and case["vet_id"]:
+                        conn.execute("INSERT OR IGNORE INTO notifications (user_id,message,type,event_id,idempotency_key,recipient_role,channel,delivery_status,case_id) SELECT id,?,?,?,?,?,'in_app','DELIVERED',? FROM users WHERE id=?", (f"GPS location received for helpline case {case['case_no']}.", "case", event_id, f"ivr-loc-vet:{call_sid}:{lat_f}:{lng_f}", "vet", linked["case_id"], case["vet_id"]))
+                    for official in conn.execute("SELECT id FROM users WHERE role='govt'").fetchall():
+                        conn.execute("INSERT OR IGNORE INTO notifications (user_id,message,type,event_id,idempotency_key,recipient_role,channel,delivery_status,case_id) VALUES (?,?,?,?,?,?, 'in_app','DELIVERED',?)", (official["id"], f"Authorised GPS location received for helpline case {case['case_no']}.", "case", event_id, f"ivr-loc-govt:{official['id']}:{call_sid}:{lat_f}:{lng_f}", "govt", linked["case_id"]))
                 conn.execute("INSERT INTO ivr_events (call_sid, event_type, details) VALUES (?,?,?)", (call_sid, "LOCATION_SHARED_VIA_SMS", json.dumps({"lat": lat_f, "lng": lng_f})))
                 conn.commit()
         except Exception as e:

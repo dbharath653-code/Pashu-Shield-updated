@@ -83,8 +83,9 @@ The database seeds demo accounts so that the first deployment can be checked:
 Log in once to validate each portal, then change the passwords or remove the
 demo accounts before real use. Do not publish these credentials.
 
-For the full production and SIP/PBX runbooks, see:
+For the full production runbooks and the honest feature-by-feature implementation matrix, see:
 
+- [`docs/FEATURE_IMPLEMENTATION_STATUS.md`](docs/FEATURE_IMPLEMENTATION_STATUS.md)
 - [`docs/PRODUCTION_DEPLOYMENT.md`](docs/PRODUCTION_DEPLOYMENT.md)
 - [`docs/IVR_DEPLOYMENT.md`](docs/IVR_DEPLOYMENT.md)
 - [`docs/PSTN_SIP_PBX.md`](docs/PSTN_SIP_PBX.md)
