@@ -1001,17 +1001,17 @@ def register_ivr_routes(app):
     @ivr_auth_required(roles=["govt"])
     def get_ivr_config():
         from .config import get_ivr_config_summary
+        # Do not read or serialize the survey definition in this portal-safe
+        # endpoint. IVR request handlers load it through the internal service.
         conn = get_db()
-        # Load survey config from DB
-        try:
-            row = conn.execute("SELECT config_value FROM ivr_survey_config WHERE config_key='survey_definition'").fetchone()
-            survey_cfg = json.loads(row["config_value"]) if row else None
-        except Exception:
-            survey_cfg = None
         conn.close()
+        # Portal-safe response: survey definitions are runtime IVR data, not
+        # government dashboard presentation data. The IVR handlers read them
+        # directly from the database; this endpoint intentionally never
+        # serializes question keys, DTMF choices, or raw configuration JSON.
         return jsonify({
             "telephony": get_ivr_config_summary(),
-            "survey": survey_cfg,
+            "status": {"survey_runtime": "enabled", "configuration": "managed by IVR service"},
         })
 
     @app.route("/api/ivr/config", methods=["PUT"])

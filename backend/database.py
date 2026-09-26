@@ -553,6 +553,11 @@ CREATE INDEX IF NOT EXISTS idx_realtime_case ON realtime_events(case_id, created
 CREATE INDEX IF NOT EXISTS idx_cases_owner ON cases(owner_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cases_vet ON cases(vet_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status, updated_at);
+-- A veterinarian can have at most one active visit per case. This protects
+-- against concurrent/double acceptance requests at the database boundary.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_case_visit
+  ON case_visits(case_id, vet_id)
+  WHERE status NOT IN ('COMPLETED', 'CANCELLED');
 CREATE INDEX IF NOT EXISTS idx_lab_reports_case ON lab_reports(case_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_lab_reports_entered ON lab_reports(entered_by, created_at);
 CREATE INDEX IF NOT EXISTS idx_weather_dist ON weather_observations(district, fetched_at);
