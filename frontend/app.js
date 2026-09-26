@@ -17,6 +17,7 @@ const state = {
   user: JSON.parse(localStorage.getItem("user") || "null"),
   lang: localStorage.getItem("pm_lang") || "en",
   route: "#/",
+  authStatus: localStorage.getItem("token") ? "loading" : "unauthenticated",
 };
 
 function getUserRole() {
@@ -146,8 +147,11 @@ window.addEventListener("online", syncOfflineQueue);
 let realtimeSource = null;
 let realtimeStarting = false;
 let realtimeReconnectTimer = null;
+let realtimeGeneration = 0;
+const processedRealtimeEvents = new Set();
 async function startRealtimeStream() {
-  if (!state.token || !window.EventSource || realtimeStarting) return;
+  if (state.authStatus !== "authenticated" || !state.token || !window.EventSource || realtimeStarting) return;
+  const generation = ++realtimeGeneration;
   if (realtimeSource) realtimeSource.close();
   realtimeStarting = true;
   try {
@@ -155,6 +159,7 @@ async function startRealtimeStream() {
     const tokenData = await tokenRes.json();
     if (!tokenRes.ok || !tokenData.token) throw new Error(tokenData.error || "Realtime token unavailable");
     const url = `${API}/realtime/stream?access_token=${encodeURIComponent(tokenData.token)}`;
+    if (generation !== realtimeGeneration || state.authStatus !== "authenticated") return;
     realtimeSource = new EventSource(url);
     realtimeSource.onopen = () => { state.realtime = "connected"; };
     realtimeSource.onerror = () => {
@@ -164,13 +169,22 @@ async function startRealtimeStream() {
       realtimeReconnectTimer = setTimeout(() => startRealtimeStream(), 2500);
     };
     const refresh = (ev) => {
-      try { const payload = JSON.parse(ev.data || "{}"); if (payload.event_type === "VET_LOCATION_UPDATED" || payload.event_type.startsWith("LAB_") || payload.event_type === "CASE_CREATED" || payload.event_type === "VET_STARTED_VISIT") { if (state.route.includes("lab-reports") || state.route.includes("lab-tracking") || state.route.includes("cases/")) router(); } } catch (_) {}
+      try {
+        const payload = JSON.parse(ev.data || "{}");
+        const eventId = ev.lastEventId || payload.event_id;
+        if (eventId && processedRealtimeEvents.has(eventId)) return;
+        if (eventId) { processedRealtimeEvents.add(eventId); if (processedRealtimeEvents.size > 500) processedRealtimeEvents.delete(processedRealtimeEvents.values().next().value); }
+        // Realtime is an incremental signal. Do not remount the current page
+        // (which caused acceptance flashes and case switching); views may opt
+        // into reconciliation without losing their local state.
+        window.dispatchEvent(new CustomEvent("pashu:realtime", { detail: payload }));
+      } catch (_) {}
     };
     ["CASE_CREATED", "VET_STARTED_VISIT", "VET_LOCATION_UPDATED", "TRACKING_STARTED", "TRACKING_STOPPED", "VET_ARRIVED", "VISIT_COMPLETED", "LAB_SAMPLE_RECEIVED", "LAB_TEST_STARTED", "LAB_RESULT_READY", "LAB_REPORT_SUBMITTED", "LAB_REPORT_STATUS_UPDATED", "HELPLINE_LOCATION_UPDATED"].forEach(name => realtimeSource.addEventListener(name, refresh));
   } catch (_) { state.realtime = "reconnecting"; }
   finally { realtimeStarting = false; }
 }
-function stopRealtimeStream() { clearTimeout(realtimeReconnectTimer); if (realtimeSource) realtimeSource.close(); realtimeSource = null; }
+function stopRealtimeStream() { realtimeGeneration++; clearTimeout(realtimeReconnectTimer); if (realtimeSource) realtimeSource.close(); realtimeSource = null; realtimeStarting = false; state.realtime = "disconnected"; }
 window.addEventListener("beforeunload", stopRealtimeStream);
 
 async function api(path, { method = "GET", body } = {}) {
@@ -214,14 +228,15 @@ async function api(path, { method = "GET", body } = {}) {
 }
 
 function setAuth(token, user) {
-  state.token = token; state.user = user;
+  state.token = token; state.user = user; state.authStatus = "authenticated";
   localStorage.setItem("token", token);
   localStorage.setItem("user", JSON.stringify(user));
   startRealtimeStream();
 }
 
 function logout(silent) {
-  state.token = null; state.user = null;
+  state.token = null; state.user = null; state.authStatus = "unauthenticated";
+  stopRealtimeStream();
   localStorage.removeItem("token"); localStorage.removeItem("user");
   location.hash = "#/";
   if (!silent) toast("Logged out successfully");
@@ -356,6 +371,26 @@ function pieChart(items) {
     </div>`;
 }
 
+// Authentication is a gate, not a best-effort side effect. Protected routes
+// are not rendered until the persisted token has been validated by /me.
+async function initializeAuth() {
+  if (!state.token) { state.authStatus = "unauthenticated"; router(); return; }
+  state.authStatus = "loading";
+  try {
+    const res = await fetch(API + "/users/me", { headers: { Authorization: "Bearer " + state.token } });
+    const user = await res.json();
+    if (!res.ok || !user || !ROLES.includes(user.role)) throw new Error(user.error || "Session validation failed");
+    state.user = user;
+    localStorage.setItem("user", JSON.stringify(user));
+    state.authStatus = "authenticated";
+    startRealtimeStream();
+  } catch (err) {
+    state.token = null; state.user = null; state.authStatus = "unauthenticated";
+    localStorage.removeItem("token"); localStorage.removeItem("user");
+  }
+  router();
+}
+
 // ------------------------------------------------------------- routing --
 const routes = {};
 function route(path, handler, roles) { routes[path] = { handler, roles }; }
@@ -365,7 +400,8 @@ function isPublic(path) {
 }
 
 async function router() {
-  if (state.token && !realtimeSource) startRealtimeStream();
+  if (state.authStatus === "loading") { render(`<div class="loading" style="min-height:60vh">Checking your session…</div>`); return; }
+  if (state.authStatus === "authenticated" && !realtimeSource) startRealtimeStream();
   const hash = location.hash || "#/";
   const [path, query] = hash.split("?");
   state.route = path;
@@ -405,7 +441,7 @@ async function router() {
   }
 }
 window.addEventListener("hashchange", router);
-window.addEventListener("DOMContentLoaded", router);
+window.addEventListener("DOMContentLoaded", initializeAuth);
 
 // ================================================================= AUTH ==
 const ROLE_META = {
@@ -2553,6 +2589,7 @@ window.captureSampleGps = function() {
 // ============================ LIVE FIELD-VISIT TRACKING ===================
 let trackTimer = null, trackMap = null, trackVet = null;
 let visitLocationWatch = null;
+const acceptingVisits = new Set();
 
 function trackStages(t) {
   const s = t.visit ? t.visit.status : null;
@@ -2660,13 +2697,24 @@ function bindVisitControls(c, role, tracking) {
   if (role !== "vet") return;
   const startBtn = document.getElementById("btnStartTrip");
   if (startBtn) startBtn.addEventListener("click", async () => {
-    try { const v = await api(`/cases/${c.id}/visit`, { method: "POST" }); toast("Visit accepted. Start GPS sharing when ready."); loadTracking(c, role); }
-    catch (err) { toast(err.message, true); }
+    if (acceptingVisits.has(c.id)) return;
+    acceptingVisits.add(c.id); startBtn.disabled = true; startBtn.textContent = "Accepting case…";
+    try {
+      const v = await api(`/cases/${c.id}/visit`, { method: "POST" });
+      toast("Visit accepted. Start GPS sharing when ready.");
+      await loadTracking(c, role);
+    } catch (err) {
+      toast(err.status === 409 ? "This case has already been accepted." : "Unable to accept this case. Please try again.", true);
+      startBtn.disabled = false; startBtn.textContent = "✅ Accept & start visit";
+    } finally { acceptingVisits.delete(c.id); }
   });
   const gpsBtn = document.getElementById("btnStartTracking");
   if (gpsBtn) gpsBtn.addEventListener("click", async () => {
-    try { const v = await api(`/cases/${c.id}/visit`, { method: "POST" }); await api(`/visits/${v.id}/start-tracking`, { method: "POST", body: { duration_minutes: 120 } }); startVetLocationWatch(v.id); toast("Secure GPS sharing started. Keep this visit active."); loadTracking(c, role); }
-    catch (err) { toast(err.message, true); }
+    if (acceptingVisits.has(c.id)) return;
+    acceptingVisits.add(c.id); gpsBtn.disabled = true; gpsBtn.textContent = "Starting GPS…";
+    try { const v = await api(`/cases/${c.id}/visit`, { method: "POST" }); await api(`/visits/${v.id}/start-tracking`, { method: "POST", body: { duration_minutes: 120 } }); startVetLocationWatch(v.id); toast("Secure GPS sharing started. Keep this visit active."); await loadTracking(c, role); }
+    catch (err) { toast(err.message, true); gpsBtn.disabled = false; gpsBtn.textContent = "📍 Start secure GPS sharing"; }
+    finally { acceptingVisits.delete(c.id); }
   });
   const stopBtn = document.getElementById("btnStopTracking");
   if (stopBtn) stopBtn.addEventListener("click", async () => { try { await api(`/visits/${tracking.visit.id}/stop-tracking`, { method: "POST", body: { reason: "veterinarian_stopped" } }); stopVetLocationWatch(); loadTracking(c, role); } catch (err) { toast(err.message, true); } });
@@ -3282,7 +3330,7 @@ route("#/govt/ivr-config", async () => {
     ${header("IVR Configuration", {back:true})}
     <div class="section-card">
       <div class="section-title">⚙️ Telephony & IVR Settings</div>
-      <div class="meta" style="margin-bottom:12px">Provider credentials are environment variables (never hard-coded). Phone number is IVR_PHONE_NUMBER. Survey questions are configurable without redeploy.</div>
+      <div class="meta" style="margin-bottom:12px">Provider credentials are kept in server environment variables. This page shows operational status only; internal survey definitions remain in the IVR service.</div>
       <div class="detail-grid">
         <div><b>IVR Phone</b>${tel.ivr_phone_number||'NOT_CONFIGURED'}</div>
         <div><b>Provider</b>${tel.telephony_provider||'mock'}</div>
@@ -3294,14 +3342,6 @@ route("#/govt/ivr-config", async () => {
         <div><b>Async</b>${tel.async_enabled ? 'Yes' : 'No'}</div>
       </div>
       ${tel.ivr_phone_number==="NOT_CONFIGURED" ? `<div class="conflict-box" style="margin-top:12px"><b>⚠️ Production requires IVR_PHONE_NUMBER</b><div>Set IVR_PHONE_NUMBER, TELEPHONY_PROVIDER, TELEPHONY_ACCOUNT_ID, TELEPHONY_AUTH_TOKEN, TELEPHONY_PHONE_NUMBER as environment variables. Current provider is mock (dev). See deployment docs.</div></div>` : ``}
-    </div>
-    <div class="section-card">
-      <div class="subheading">📝 Survey Questions (configurable)</div>
-      <div class="meta" style="margin-bottom:8px">Questions are multilingual and support DTMF+speech with 9=repeat, 0=back, #=skip. Pregnancy questions are conditional on species.</div>
-      <div style="max-height:240px;overflow-y:auto;background:#f8f9fe;padding:10px;border-radius:12px;font-size:12px">
-        <pre style="white-space:pre-wrap;margin:0">${JSON.stringify(cfg.survey, null, 2).slice(0,3000)}</pre>
-      </div>
-      <div class="small-muted" style="margin-top:8px">To modify, use PUT /api/ivr/config (govt only) with updated JSON.</div>
     </div>
     <div class="section-card">
       <div class="section-title">🔒 Security & Compliance</div>

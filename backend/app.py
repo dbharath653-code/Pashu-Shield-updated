@@ -1283,14 +1283,22 @@ def start_visit(case_id):
     if not _can_access_case(conn, case, allow_govt=False):
         conn.close()
         return jsonify({"error": "This case is outside your authorized veterinarian jurisdiction"}), 403
+    # Serialize acceptance and assignment. The frontend guard prevents double
+    # clicks, but the database must also be safe for two concurrent requests.
+    conn.execute("BEGIN IMMEDIATE")
     existing = conn.execute(
         "SELECT id FROM case_visits WHERE case_id=? AND vet_id=? AND status NOT IN ('COMPLETED','CANCELLED') ORDER BY id DESC LIMIT 1",
         (case_id, g.user["uid"]),
     ).fetchone()
     if existing:
+        conn.commit()
         result = _visit_response(conn, existing["id"])
         conn.close()
         return jsonify(result)
+    # A case already accepted by another veterinarian is not reassigned.
+    if case["vet_id"] is not None and case["vet_id"] != g.user["uid"]:
+        conn.rollback(); conn.close()
+        return jsonify({"error": "This case has already been accepted by another veterinarian"}), 409
     data = request.get_json(silent=True) or {}
     # Optional coordinates are accepted only as an actual device observation.
     # They are not replaced with district centroids when absent.
@@ -1303,7 +1311,13 @@ def start_visit(case_id):
         "INSERT INTO case_visits (case_id,vet_id,status,from_lat,from_lng,to_lat,to_lng,travel_seconds,started_at) VALUES (?,?,?,?,?,?,?,NULL,datetime('now'))",
         (case_id, g.user["uid"], "ON_THE_WAY", from_lat, from_lng, to_lat, to_lng),
     )
-    conn.execute("UPDATE cases SET vet_id=?, status='UNDER INVESTIGATION', updated_at=datetime('now') WHERE id=?", (g.user["uid"], case_id))
+    assigned = conn.execute(
+        "UPDATE cases SET vet_id=?, status='UNDER INVESTIGATION', updated_at=datetime('now') WHERE id=? AND (vet_id IS NULL OR vet_id=?)",
+        (g.user["uid"], case_id, g.user["uid"]),
+    )
+    if assigned.rowcount != 1:
+        conn.rollback(); conn.close()
+        return jsonify({"error": "This case has already been accepted by another veterinarian"}), 409
     conn.execute("INSERT INTO case_updates (case_id,status,note,updated_by) VALUES (?,?,?,?)",
                  (case_id, "ON_THE_WAY", "Veterinarian accepted the case and started the visit.", g.user["name"]))
     emit_event(conn, "VET_STARTED_VISIT", {"visit_id": cur.lastrowid, "status": "ON_THE_WAY"},
